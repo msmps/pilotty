@@ -9,7 +9,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::args::{Cli, Commands};
-use crate::daemon::{DaemonClient, DaemonServer};
+use crate::daemon::client::DaemonClient;
+use crate::daemon::server::DaemonServer;
 
 fn main() {
     // Initialize tracing
