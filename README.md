@@ -248,9 +248,45 @@ All errors include AI-friendly suggestions:
 | `PILOTTY_SOCKET_DIR` | Override socket directory |
 | `RUST_LOG` | Logging level (e.g., `debug`, `info`) |
 
-## AI Agent Workflow
+## Usage with AI Agents
 
-Recommended workflow for AI agents:
+### AI Coding Assistants
+
+Add the skill to your AI coding assistant for richer context:
+
+```bash
+npx skills add msmps/pilotty
+```
+
+This works with Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, Goose, OpenCode, and Windsurf.
+
+### Just Ask the Agent
+
+The simplest approach - just tell your agent to use it:
+
+```
+Use pilotty to interact with vim. Run pilotty --help to see available commands.
+```
+
+The `--help` output is comprehensive and most agents can figure it out from there.
+
+### AGENTS.md / CLAUDE.md
+
+For more consistent results, add to your project or global instructions file:
+
+```markdown
+## Terminal Automation
+
+Use `pilotty` for TUI automation. Run `pilotty --help` for all commands.
+
+Core workflow:
+1. `pilotty spawn <command>` - Start a TUI application
+2. `pilotty snapshot` - Get screen state with cursor position
+3. `pilotty key Tab` / `pilotty type "text"` - Navigate and interact
+4. Re-snapshot after screen changes
+```
+
+### Example Workflow
 
 ```bash
 # 1. Spawn the application
@@ -262,15 +298,14 @@ pilotty wait-for "myfile.txt"
 # 3. Take a snapshot to understand the screen
 pilotty snapshot
 
-# 4. Parse the text content and cursor position
-# 5. Navigate using keyboard commands
+# 4. Navigate using keyboard commands
 pilotty key i                    # Enter insert mode
 pilotty type "Hello, World!"
 pilotty key Escape
 pilotty type ":wq"
 pilotty key Enter
 
-# 6. Take another snapshot if needed
+# 5. Re-snapshot after screen changes
 pilotty snapshot
 ```
 
