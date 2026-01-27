@@ -786,15 +786,23 @@ async fn handle_key(
         Err(e) => return Response::error(request_id, e),
     };
 
+    // Get application cursor mode for proper arrow key encoding.
+    // TUI apps like dialog, vim, htop enable this mode (DECCKM) and expect
+    // arrow keys to send SS3 sequences (\x1bO) instead of CSI (\x1b[).
+    let app_cursor = sessions
+        .get_application_cursor_mode(&session_id)
+        .await
+        .unwrap_or(false);
+
     // Try to parse the key
     // Note: We check for combos only if there's a `+` that's not the entire key
     // This allows sending literal `+` as a single character
     let bytes = if key.len() > 1 && key.contains('+') {
         // Key combo like Ctrl+C (but not a literal "+")
-        parse_key_combo(&key)
+        parse_key_combo(&key, app_cursor)
     } else {
         // Named key like Enter, Plus, or single character (including "+")
-        key_to_bytes(&key).or_else(|| {
+        key_to_bytes(&key, app_cursor).or_else(|| {
             // Fall back to single character
             if key.len() == 1 {
                 Some(key.as_bytes().to_vec())

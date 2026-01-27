@@ -103,6 +103,11 @@ impl Session {
         self.terminal.lock().await.cursor_visible()
     }
 
+    /// Check if terminal is in application cursor mode.
+    pub async fn application_cursor(&self) -> bool {
+        self.terminal.lock().await.application_cursor()
+    }
+
     /// Write bytes to the PTY (send input to the terminal).
     pub async fn write(&self, data: &[u8]) -> anyhow::Result<()> {
         self.pty.write(data).await
@@ -448,6 +453,21 @@ impl SessionManager {
             .get(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
         Ok(session.size)
+    }
+
+    /// Get the application cursor mode for a session.
+    ///
+    /// Drains pending PTY output first to ensure mode is current.
+    /// When true, arrow keys should send SS3 sequences instead of CSI.
+    pub async fn get_application_cursor_mode(&self, id: &SessionId) -> Result<bool, ApiError> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(id)
+            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
+
+        // Drain to get current terminal state
+        session.drain_pty_output().await;
+        Ok(session.application_cursor().await)
     }
 
     /// Spawn a background task that cleans up dead sessions.

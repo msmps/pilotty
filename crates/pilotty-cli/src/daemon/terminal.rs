@@ -49,6 +49,14 @@ impl TerminalEmulator {
         !self.parser.screen().hide_cursor()
     }
 
+    /// Check if terminal is in application cursor mode (DECCKM).
+    ///
+    /// When true, arrow keys should send SS3 sequences (`\x1bO`) instead of CSI (`\x1b[`).
+    /// Applications like dialog, vim, htop enable this mode via `ESC[?1h`.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
     /// Get a cell at the given position.
     ///
     /// Returns None if position is out of bounds.
@@ -455,6 +463,31 @@ mod tests {
         assert!(
             term.cursor_visible(),
             "Cursor should be visible after ESC[?25h"
+        );
+    }
+
+    #[test]
+    fn test_application_cursor_mode() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+
+        // Default is normal cursor mode
+        assert!(
+            !term.application_cursor(),
+            "Default should be normal cursor mode"
+        );
+
+        // Enable application cursor mode: ESC[?1h (DECCKM set)
+        term.feed(b"\x1b[?1h");
+        assert!(
+            term.application_cursor(),
+            "Should be application mode after ESC[?1h"
+        );
+
+        // Disable application cursor mode: ESC[?1l (DECCKM reset)
+        term.feed(b"\x1b[?1l");
+        assert!(
+            !term.application_cursor(),
+            "Should be normal mode after ESC[?1l"
         );
     }
 }

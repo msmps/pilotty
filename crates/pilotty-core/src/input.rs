@@ -68,11 +68,51 @@ pub fn encode_text(text: &str) -> Vec<u8> {
 
 /// Named keys and their byte sequences.
 ///
+/// The `application_cursor` parameter affects arrow key encoding:
+/// - `false`: CSI sequences (`\x1b[A`, `\x1b[B`, etc.) for normal mode
+/// - `true`: SS3 sequences (`\x1bOA`, `\x1bOB`, etc.) for application mode
+///
+/// TUI applications like dialog, vim, htop enable application cursor mode
+/// via DECCKM (`ESC[?1h`), and arrow keys must use SS3 encoding to work.
+///
 /// Returns the escape sequence for a named key, or None if not recognized.
-pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
+pub fn key_to_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
     // Normalize key name (case insensitive)
     let key_lower = key.to_lowercase();
     let key_str = key_lower.as_str();
+
+    // Arrow keys depend on application cursor mode
+    match key_str {
+        "up" | "arrowup" => {
+            return Some(if application_cursor {
+                b"\x1bOA".to_vec()
+            } else {
+                b"\x1b[A".to_vec()
+            });
+        }
+        "down" | "arrowdown" => {
+            return Some(if application_cursor {
+                b"\x1bOB".to_vec()
+            } else {
+                b"\x1b[B".to_vec()
+            });
+        }
+        "right" | "arrowright" => {
+            return Some(if application_cursor {
+                b"\x1bOC".to_vec()
+            } else {
+                b"\x1b[C".to_vec()
+            });
+        }
+        "left" | "arrowleft" => {
+            return Some(if application_cursor {
+                b"\x1bOD".to_vec()
+            } else {
+                b"\x1b[D".to_vec()
+            });
+        }
+        _ => {}
+    }
 
     let bytes: &[u8] = match key_str {
         // Basic keys
@@ -83,12 +123,6 @@ pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
         "delete" | "del" => b"\x1b[3~",
         "space" => b" ",
         "plus" => b"+", // Named alias for literal + (useful since + is combo separator)
-
-        // Arrow keys (standard ANSI)
-        "up" | "arrowup" => b"\x1b[A",
-        "down" | "arrowdown" => b"\x1b[B",
-        "right" | "arrowright" => b"\x1b[C",
-        "left" | "arrowleft" => b"\x1b[D",
 
         // Navigation keys
         "home" => b"\x1b[H",
@@ -119,12 +153,14 @@ pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
 
 /// Parse a key combo like "Ctrl+C" or "Alt+F" and return the bytes.
 ///
+/// The `application_cursor` parameter affects arrow key encoding in combos.
+///
 /// Supports:
 /// - Ctrl+<key>: Control character (Ctrl+A = 0x01, Ctrl+C = 0x03, etc.)
 /// - Alt+<key>: Escape prefix + key (Alt+F = ESC f)
 /// - Shift+<key>: Uppercase for letters, otherwise ignored
 /// - Combinations: Ctrl+Alt+<key>, etc.
-pub fn parse_key_combo(combo: &str) -> Option<Vec<u8>> {
+pub fn parse_key_combo(combo: &str, application_cursor: bool) -> Option<Vec<u8>> {
     let parts: Vec<&str> = combo.split('+').collect();
 
     if parts.is_empty() {
@@ -161,7 +197,7 @@ pub fn parse_key_combo(combo: &str) -> Option<Vec<u8>> {
     }
 
     // Try as named key first
-    if let Some(bytes) = key_to_bytes(key_part) {
+    if let Some(bytes) = key_to_bytes(key_part, application_cursor) {
         // For named keys, modifiers are typically not applied (except Alt prefix)
         if alt {
             let mut result = vec![0x1b];
@@ -309,95 +345,112 @@ mod tests {
 
     #[test]
     fn test_key_to_bytes_enter() {
-        assert_eq!(key_to_bytes("Enter"), Some(b"\r".to_vec()));
-        assert_eq!(key_to_bytes("ENTER"), Some(b"\r".to_vec()));
-        assert_eq!(key_to_bytes("enter"), Some(b"\r".to_vec()));
+        assert_eq!(key_to_bytes("Enter", false), Some(b"\r".to_vec()));
+        assert_eq!(key_to_bytes("ENTER", false), Some(b"\r".to_vec()));
+        assert_eq!(key_to_bytes("enter", false), Some(b"\r".to_vec()));
     }
 
     #[test]
     fn test_key_to_bytes_escape() {
-        assert_eq!(key_to_bytes("Escape"), Some(vec![0x1b]));
-        assert_eq!(key_to_bytes("Esc"), Some(vec![0x1b]));
+        assert_eq!(key_to_bytes("Escape", false), Some(vec![0x1b]));
+        assert_eq!(key_to_bytes("Esc", false), Some(vec![0x1b]));
     }
 
     #[test]
-    fn test_key_to_bytes_arrows() {
-        assert_eq!(key_to_bytes("Up"), Some(b"\x1b[A".to_vec()));
-        assert_eq!(key_to_bytes("Down"), Some(b"\x1b[B".to_vec()));
-        assert_eq!(key_to_bytes("Right"), Some(b"\x1b[C".to_vec()));
-        assert_eq!(key_to_bytes("Left"), Some(b"\x1b[D".to_vec()));
+    fn test_key_to_bytes_arrows_normal_mode() {
+        // Normal cursor mode: CSI sequences
+        assert_eq!(key_to_bytes("Up", false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_to_bytes("Down", false), Some(b"\x1b[B".to_vec()));
+        assert_eq!(key_to_bytes("Right", false), Some(b"\x1b[C".to_vec()));
+        assert_eq!(key_to_bytes("Left", false), Some(b"\x1b[D".to_vec()));
+    }
+
+    #[test]
+    fn test_key_to_bytes_arrows_application_mode() {
+        // Application cursor mode: SS3 sequences (used by dialog, vim, htop, etc.)
+        assert_eq!(key_to_bytes("Up", true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(key_to_bytes("Down", true), Some(b"\x1bOB".to_vec()));
+        assert_eq!(key_to_bytes("Right", true), Some(b"\x1bOC".to_vec()));
+        assert_eq!(key_to_bytes("Left", true), Some(b"\x1bOD".to_vec()));
     }
 
     #[test]
     fn test_key_to_bytes_function_keys() {
-        assert_eq!(key_to_bytes("F1"), Some(b"\x1bOP".to_vec()));
-        assert_eq!(key_to_bytes("F5"), Some(b"\x1b[15~".to_vec()));
-        assert_eq!(key_to_bytes("F12"), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(key_to_bytes("F1", false), Some(b"\x1bOP".to_vec()));
+        assert_eq!(key_to_bytes("F5", false), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(key_to_bytes("F12", false), Some(b"\x1b[24~".to_vec()));
     }
 
     #[test]
     fn test_key_to_bytes_unknown() {
-        assert_eq!(key_to_bytes("NotAKey"), None);
+        assert_eq!(key_to_bytes("NotAKey", false), None);
     }
 
     #[test]
     fn test_key_to_bytes_plus() {
         // "plus" is a named alias for the literal + character
-        assert_eq!(key_to_bytes("plus"), Some(b"+".to_vec()));
-        assert_eq!(key_to_bytes("Plus"), Some(b"+".to_vec()));
-        assert_eq!(key_to_bytes("PLUS"), Some(b"+".to_vec()));
+        assert_eq!(key_to_bytes("plus", false), Some(b"+".to_vec()));
+        assert_eq!(key_to_bytes("Plus", false), Some(b"+".to_vec()));
+        assert_eq!(key_to_bytes("PLUS", false), Some(b"+".to_vec()));
     }
 
     #[test]
     fn test_parse_key_combo_ctrl_c() {
-        assert_eq!(parse_key_combo("Ctrl+C"), Some(vec![0x03]));
-        assert_eq!(parse_key_combo("ctrl+c"), Some(vec![0x03]));
+        assert_eq!(parse_key_combo("Ctrl+C", false), Some(vec![0x03]));
+        assert_eq!(parse_key_combo("ctrl+c", false), Some(vec![0x03]));
     }
 
     #[test]
     fn test_parse_key_combo_ctrl_letters() {
-        assert_eq!(parse_key_combo("Ctrl+A"), Some(vec![0x01]));
-        assert_eq!(parse_key_combo("Ctrl+Z"), Some(vec![0x1a]));
-        assert_eq!(parse_key_combo("Ctrl+S"), Some(vec![0x13])); // XOFF
-        assert_eq!(parse_key_combo("Ctrl+Q"), Some(vec![0x11])); // XON
+        assert_eq!(parse_key_combo("Ctrl+A", false), Some(vec![0x01]));
+        assert_eq!(parse_key_combo("Ctrl+Z", false), Some(vec![0x1a]));
+        assert_eq!(parse_key_combo("Ctrl+S", false), Some(vec![0x13])); // XOFF
+        assert_eq!(parse_key_combo("Ctrl+Q", false), Some(vec![0x11])); // XON
     }
 
     #[test]
     fn test_parse_key_combo_alt_letter() {
         // Alt+F should be ESC followed by 'f'
-        assert_eq!(parse_key_combo("Alt+f"), Some(vec![0x1b, b'f']));
-        assert_eq!(parse_key_combo("Alt+F"), Some(vec![0x1b, b'F']));
+        assert_eq!(parse_key_combo("Alt+f", false), Some(vec![0x1b, b'f']));
+        assert_eq!(parse_key_combo("Alt+F", false), Some(vec![0x1b, b'F']));
     }
 
     #[test]
     fn test_parse_key_combo_ctrl_alt() {
         // Ctrl+Alt+C = ESC followed by Ctrl+C
-        assert_eq!(parse_key_combo("Ctrl+Alt+C"), Some(vec![0x1b, 0x03]));
+        assert_eq!(parse_key_combo("Ctrl+Alt+C", false), Some(vec![0x1b, 0x03]));
     }
 
     #[test]
     fn test_parse_key_combo_named_key() {
-        assert_eq!(parse_key_combo("Enter"), Some(b"\r".to_vec()));
-        assert_eq!(parse_key_combo("Tab"), Some(b"\t".to_vec()));
+        assert_eq!(parse_key_combo("Enter", false), Some(b"\r".to_vec()));
+        assert_eq!(parse_key_combo("Tab", false), Some(b"\t".to_vec()));
     }
 
     #[test]
     fn test_parse_key_combo_alt_named_key() {
         // Alt+Enter = ESC followed by CR
-        let result = parse_key_combo("Alt+Enter");
+        let result = parse_key_combo("Alt+Enter", false);
         assert_eq!(result, Some(vec![0x1b, b'\r']));
     }
 
     #[test]
     fn test_parse_key_combo_shift() {
         // Shift+a = A
-        assert_eq!(parse_key_combo("Shift+a"), Some(b"A".to_vec()));
+        assert_eq!(parse_key_combo("Shift+a", false), Some(b"A".to_vec()));
     }
 
     #[test]
     fn test_parse_key_combo_ctrl_special() {
-        assert_eq!(parse_key_combo("Ctrl+["), Some(vec![0x1b])); // Escape
-        assert_eq!(parse_key_combo("Ctrl+Space"), Some(vec![0x00])); // NUL
+        assert_eq!(parse_key_combo("Ctrl+[", false), Some(vec![0x1b])); // Escape
+        assert_eq!(parse_key_combo("Ctrl+Space", false), Some(vec![0x00])); // NUL
+    }
+
+    #[test]
+    fn test_parse_key_combo_alt_arrow_application_mode() {
+        // Alt+Up in application cursor mode = ESC followed by SS3 sequence
+        let result = parse_key_combo("Alt+Up", true);
+        assert_eq!(result, Some(vec![0x1b, 0x1b, b'O', b'A']));
     }
 
     #[test]
