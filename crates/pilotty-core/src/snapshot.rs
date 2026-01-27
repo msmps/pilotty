@@ -17,13 +17,16 @@ impl RefId {
     /// The id should be in the format `@e<number>` (e.g., `@e1`, `@e42`).
     /// Empty strings are allowed for unassigned refs before `assign_refs` is called.
     ///
-    /// In debug builds, invalid formats will trigger an assertion failure to catch
-    /// bugs early. In release builds, no validation is performed for performance.
+    /// # Panics
+    ///
+    /// Panics if the format is invalid. All internal callers use `format!("@e{}", n)`
+    /// which is always valid, so this catches bugs in calling code immediately.
+    /// For untrusted input, use [`RefId::try_new`] instead.
     pub fn new(id: impl Into<String>) -> Self {
         let s = id.into();
-        debug_assert!(
+        assert!(
             s.is_empty() || Self::is_valid_format(&s),
-            "RefId should be empty or in format @e<number>, got: {s}"
+            "RefId must be empty or in format @e<number>, got: {s}"
         );
         Self(s)
     }

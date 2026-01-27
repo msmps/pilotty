@@ -218,8 +218,10 @@ impl SessionManager {
     }
 
     /// Get the next snapshot ID (incrementing counter).
+    ///
+    /// Uses Relaxed ordering since snapshot IDs only need uniqueness, not global ordering.
     pub fn next_snapshot_id(&self) -> u64 {
-        self.snapshot_counter.fetch_add(1, Ordering::SeqCst)
+        self.snapshot_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Create a new session by spawning a PTY.

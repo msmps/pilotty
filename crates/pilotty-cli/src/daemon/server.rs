@@ -693,21 +693,30 @@ fn format_text_snapshot(
     // Screen content
     for (row_idx, line) in text.lines().enumerate() {
         if row_idx == cursor_row as usize {
-            // Mark cursor position in this line
-            let line_chars: Vec<char> = line.chars().collect();
+            // Mark cursor position in this line using char_indices to avoid Vec<char> allocation
             let col = cursor_col as usize;
 
-            if col < line_chars.len() {
-                // Insert cursor marker
-                let before: String = line_chars[..col].iter().collect();
-                let at_cursor = line_chars[col];
-                let after: String = line_chars[col + 1..].iter().collect();
-                output.push_str(&format!("{}[{}]{}\n", before, at_cursor, after));
+            // Find byte offset of the col-th character
+            let mut char_iter = line.char_indices();
+            let cursor_info = char_iter.nth(col);
+
+            if let Some((byte_offset, cursor_char)) = cursor_info {
+                // Insert cursor marker using string slices (no allocation)
+                let before = &line[..byte_offset];
+                let after_offset = byte_offset + cursor_char.len_utf8();
+                let after = &line[after_offset..];
+                output.push_str(before);
+                output.push('[');
+                output.push(cursor_char);
+                output.push(']');
+                output.push_str(after);
+                output.push('\n');
             } else {
                 // Cursor is at or past end of line
                 output.push_str(line);
-                if col > line_chars.len() {
-                    output.push_str(&" ".repeat(col - line_chars.len()));
+                let char_count = line.chars().count();
+                if col > char_count {
+                    output.push_str(&" ".repeat(col - char_count));
                 }
                 output.push_str("[_]\n");
             }
