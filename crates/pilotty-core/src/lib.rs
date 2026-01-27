@@ -6,6 +6,4 @@
 pub mod error;
 pub mod input;
 pub mod protocol;
-pub mod refs;
-pub mod region;
 pub mod snapshot;

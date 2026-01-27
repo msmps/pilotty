@@ -11,7 +11,6 @@ use tracing::{debug, info};
 
 use pilotty_core::error::ApiError;
 use pilotty_core::protocol::SessionInfo;
-use pilotty_core::refs::RefTracker;
 
 use crate::daemon::pty::{AsyncPtyHandle, PtySession, TermSize};
 use crate::daemon::terminal::TerminalEmulator;
@@ -57,7 +56,6 @@ pub struct SnapshotData {
     pub cursor_pos: (u16, u16),
     pub cursor_visible: bool,
     pub size: TermSize,
-    pub cells: Vec<Vec<pilotty_core::region::Cell>>,
 }
 
 /// An active PTY session.
@@ -77,9 +75,6 @@ pub struct Session {
     /// Terminal emulator tracking screen state.
     /// Wrapped in Mutex for interior mutability (fed by PTY reader task).
     pub terminal: Arc<Mutex<TerminalEmulator>>,
-    /// Ref tracker for stable region references across snapshots.
-    /// Wrapped in Mutex for interior mutability during snapshot.
-    pub ref_tracker: Mutex<RefTracker>,
 }
 
 impl Session {
@@ -106,20 +101,6 @@ impl Session {
     /// Check if the cursor is visible.
     pub async fn cursor_visible(&self) -> bool {
         self.terminal.lock().await.cursor_visible()
-    }
-
-    /// Get all cells for region detection.
-    pub async fn get_cells(&self) -> Vec<Vec<pilotty_core::region::Cell>> {
-        self.terminal.lock().await.get_cells()
-    }
-
-    /// Assign stable refs to regions using the session's RefTracker.
-    ///
-    /// This maintains ref stability across snapshots - regions that haven't
-    /// changed keep the same ref ID, making it safe to click on refs from
-    /// a recent snapshot.
-    pub async fn assign_refs(&self, regions: &mut [pilotty_core::snapshot::Region]) {
-        self.ref_tracker.lock().await.assign_refs(regions);
     }
 
     /// Write bytes to the PTY (send input to the terminal).
@@ -275,7 +256,6 @@ impl SessionManager {
             size,
             pty,
             terminal,
-            ref_tracker: Mutex::new(RefTracker::new()),
         };
 
         let mut sessions = self.sessions.write().await;
@@ -408,14 +388,12 @@ impl SessionManager {
         let cursor_pos = session.cursor_position().await;
         let cursor_visible = session.cursor_visible().await;
         let size = session.size;
-        let cells = session.get_cells().await;
 
         Ok(SnapshotData {
             text,
             cursor_pos,
             cursor_visible,
             size,
-            cells,
         })
     }
 
@@ -470,22 +448,6 @@ impl SessionManager {
             .get(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
         Ok(session.size)
-    }
-
-    /// Assign stable refs to regions for a session.
-    ///
-    /// Uses the session's RefTracker to maintain ref stability across snapshots.
-    pub async fn assign_refs(
-        &self,
-        id: &SessionId,
-        regions: &mut [pilotty_core::snapshot::Region],
-    ) -> Result<(), ApiError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
-        session.assign_refs(regions).await;
-        Ok(())
     }
 
     /// Spawn a background task that cleans up dead sessions.

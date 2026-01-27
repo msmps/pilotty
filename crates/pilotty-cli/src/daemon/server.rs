@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pilotty_core::error::ApiError;
+use pilotty_core::input::encode_mouse_click_combined;
 use pilotty_core::protocol::{Command, Request, Response, ResponseData, SnapshotFormat};
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -514,8 +515,8 @@ async fn handle_request(
 
         Command::Key { key, session } => handle_key(&request.id, &sessions, key, session).await,
 
-        Command::Click { ref_id, session } => {
-            handle_click(&request.id, &sessions, ref_id, session).await
+        Command::Click { row, col, session } => {
+            handle_click(&request.id, &sessions, row, col, session).await
         }
 
         Command::Scroll {
@@ -612,15 +613,7 @@ async fn handle_snapshot(
             )
         }
         SnapshotFormat::Full | SnapshotFormat::Compact => {
-            // Run region detection
-            let mut regions = detect_regions(snapshot.cells);
-
-            // Assign stable refs using session's RefTracker
-            if let Err(e) = sessions.assign_refs(&session_id, &mut regions).await {
-                return Response::error(request_id, e);
-            }
-
-            // Build full ScreenState JSON
+            // Build ScreenState JSON
             let snapshot_id = sessions.next_snapshot_id();
             let screen_state = ScreenState {
                 snapshot_id,
@@ -633,8 +626,6 @@ async fn handle_snapshot(
                     col: cursor_col,
                     visible: snapshot.cursor_visible,
                 },
-                regions,
-                active_region: None,
                 text: if format == SnapshotFormat::Full {
                     Some(snapshot.text)
                 } else {
@@ -644,35 +635,6 @@ async fn handle_snapshot(
             Response::success(request_id, ResponseData::ScreenState(screen_state))
         }
     }
-}
-
-/// Run all region detection algorithms on the screen.
-fn detect_regions(
-    cells: Vec<Vec<pilotty_core::region::Cell>>,
-) -> Vec<pilotty_core::snapshot::Region> {
-    use pilotty_core::region::{
-        deduplicate_regions, detect_boxes, detect_highlighted_regions, detect_patterns,
-        detect_underlined_shortcuts, Screen,
-    };
-
-    let screen = Screen::from_cells(cells);
-    let mut ref_counter = 0;
-    let mut regions = Vec::new();
-
-    // Detect bordered boxes (dialogs, panels)
-    regions.extend(detect_boxes(&screen, &mut ref_counter));
-
-    // Detect highlighted regions (menu bars, selected items)
-    regions.extend(detect_highlighted_regions(&screen, &mut ref_counter));
-
-    // Detect patterns (buttons, checkboxes, radio buttons, menu shortcuts)
-    regions.extend(detect_patterns(&screen, &mut ref_counter));
-
-    // Detect underlined shortcuts
-    regions.extend(detect_underlined_shortcuts(&screen, &mut ref_counter));
-
-    // Deduplicate overlapping regions (e.g., button detected by both box and pattern detectors)
-    deduplicate_regions(regions)
 }
 
 /// Format a plain text snapshot with cursor position indicator.
@@ -870,77 +832,34 @@ async fn handle_key(
     }
 }
 
-/// Handle click command - click a region by ref.
+/// Handle click command - click at a specific row/column coordinate.
 async fn handle_click(
     request_id: &str,
     sessions: &SessionManager,
-    ref_id: String,
+    row: u16,
+    col: u16,
     session: Option<String>,
 ) -> Response {
-    use pilotty_core::input::encode_mouse_click_combined;
-    use pilotty_core::refs::{region_center, resolve_ref_or_error};
-    use pilotty_core::snapshot::RegionType;
-
     // Resolve session
     let session_id = match sessions.resolve_session(session.as_deref()).await {
         Ok(id) => id,
         Err(e) => return Response::error(request_id, e),
     };
 
-    // Get snapshot data to detect regions
-    let snapshot = match sessions.get_snapshot_data(&session_id).await {
-        Ok(data) => data,
-        Err(e) => return Response::error(request_id, e),
-    };
-
-    // Detect regions and assign stable refs
-    let mut regions = detect_regions(snapshot.cells);
-    if let Err(e) = sessions.assign_refs(&session_id, &mut regions).await {
-        return Response::error(request_id, e);
-    }
-
-    // Resolve the ref
-    let region = match resolve_ref_or_error(&ref_id, &regions) {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::error(
-                request_id,
-                ApiError::ref_not_found_with_suggestion(&ref_id, &e.suggestion),
-            );
-        }
-    };
-
-    // Get click position (center of region)
-    let (click_x, click_y) = region_center(&region.bounds);
-
-    // Generate mouse click sequence
-    let click_bytes = encode_mouse_click_combined(click_x, click_y);
+    // Generate mouse click sequence (encode_mouse_click_combined takes col, row)
+    let click_bytes = encode_mouse_click_combined(col, row);
 
     // Send the click
     if let Err(e) = sessions.write_to_session(&session_id, &click_bytes).await {
         return Response::error(request_id, e);
     }
 
-    // For buttons, also send Enter after a brief moment (some TUIs don't support mouse)
-    if region.region_type == RegionType::Button {
-        // Send Enter as a fallback for TUIs without mouse support
-        if let Err(e) = sessions.write_to_session(&session_id, b"\r").await {
-            return Response::error(request_id, e);
-        }
-    }
-
-    debug!(
-        "Clicked region {} at ({}, {}) in session {}",
-        ref_id, click_x, click_y, session_id
-    );
+    debug!("Clicked at ({}, {}) in session {}", row, col, session_id);
 
     Response::success(
         request_id,
         ResponseData::Ok {
-            message: format!(
-                "Clicked {} ({}) at ({}, {})",
-                ref_id, region.text, click_x, click_y
-            ),
+            message: format!("Clicked at row {}, col {}", row, col),
         },
     )
 }
@@ -1554,138 +1473,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_detects_regions() {
-        use pilotty_core::snapshot::RegionType;
-
-        let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("pilotty-regions-{}.sock", std::process::id()));
-        let pid_path = socket_path.with_extension("pid");
-
-        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
-            .await
-            .expect("Failed to bind server");
-
-        let server_handle = tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(5), server.run()).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .expect("Failed to connect");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-
-        // Spawn a session that outputs UI-like patterns
-        // Using printf to output patterns that region detection should find
-        let spawn_request = Request {
-            id: "spawn-1".to_string(),
-            command: Command::Spawn {
-                command: vec![
-                    "printf".to_string(),
-                    "[ OK ]  [ Cancel ]\\n[x] Option A\\n[ ] Option B\\n".to_string(),
-                ],
-                session_name: Some("region-test".to_string()),
-            },
-        };
-        let request_json = serde_json::to_string(&spawn_request).unwrap();
-        writer
-            .write_all(request_json.as_bytes())
-            .await
-            .expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        let mut response_line = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        // Give time for output
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Request snapshot with Full format
-        let snap_request = Request {
-            id: "snap-regions".to_string(),
-            command: Command::Snapshot {
-                session: Some("region-test".to_string()),
-                format: Some(SnapshotFormat::Full),
-            },
-        };
-        let snap_json = serde_json::to_string(&snap_request).unwrap();
-        writer.write_all(snap_json.as_bytes()).await.expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        response_line.clear();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        let snap_response: Response =
-            serde_json::from_str(&response_line).expect("parse snap response");
-        assert!(snap_response.success, "Snapshot should succeed");
-
-        // Verify regions are detected
-        if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
-            // Should detect at least some regions
-            assert!(
-                !screen_state.regions.is_empty(),
-                "Should detect some regions, text was:\n{}",
-                screen_state.text.as_deref().unwrap_or("(no text)")
-            );
-
-            // Check for buttons
-            let buttons: Vec<_> = screen_state
-                .regions
-                .iter()
-                .filter(|r| r.region_type == RegionType::Button)
-                .collect();
-
-            // Check for checkboxes
-            let checkboxes: Vec<_> = screen_state
-                .regions
-                .iter()
-                .filter(|r| r.region_type == RegionType::Checkbox)
-                .collect();
-
-            // We expect at least 2 buttons (OK, Cancel) and 2 checkboxes
-            assert!(
-                buttons.len() >= 2,
-                "Should detect at least 2 buttons, found {}: {:?}",
-                buttons.len(),
-                buttons
-            );
-            assert!(
-                checkboxes.len() >= 2,
-                "Should detect at least 2 checkboxes, found {}: {:?}",
-                checkboxes.len(),
-                checkboxes
-            );
-
-            // Verify ref IDs are assigned
-            for region in &screen_state.regions {
-                assert!(
-                    region.ref_id.as_str().starts_with("@e"),
-                    "Ref ID should start with @e: {}",
-                    region.ref_id
-                );
-            }
-        } else {
-            panic!(
-                "Expected ScreenState response data, got: {:?}",
-                snap_response.data
-            );
-        }
-
-        server_handle.abort();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
     async fn test_type_command() {
         let temp_dir = std::env::temp_dir();
         let socket_path = temp_dir.join(format!("pilotty-type-{}.sock", std::process::id()));
@@ -1920,11 +1707,11 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        // Spawn a session that outputs UI-like patterns
+        // Spawn a session
         let spawn_request = Request {
             id: "spawn-1".to_string(),
             command: Command::Spawn {
-                command: vec!["printf".to_string(), "[ OK ]  [ Cancel ]\\n".to_string()],
+                command: vec!["cat".to_string()],
                 session_name: Some("click-test".to_string()),
             },
         };
@@ -1942,48 +1729,14 @@ mod tests {
             .expect("timeout")
             .expect("read");
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Try to click a region that exists
-        // First get the snapshot to see what refs are available
-        let snap_request = Request {
-            id: "snap-1".to_string(),
-            command: Command::Snapshot {
-                session: Some("click-test".to_string()),
-                format: Some(SnapshotFormat::Full),
-            },
-        };
-        let snap_json = serde_json::to_string(&snap_request).unwrap();
-        writer.write_all(snap_json.as_bytes()).await.expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        response_line.clear();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        let snap_response: Response =
-            serde_json::from_str(&response_line).expect("parse snap response");
-        assert!(snap_response.success, "Snapshot should succeed");
-
-        // Get the first region ref
-        let first_ref = if let Some(ResponseData::ScreenState(screen_state)) = &snap_response.data {
-            if !screen_state.regions.is_empty() {
-                screen_state.regions[0].ref_id.to_string()
-            } else {
-                "@e1".to_string() // fallback, will fail gracefully
-            }
-        } else {
-            "@e1".to_string()
-        };
-
-        // Now click the region
+        // Click at coordinates (row 5, col 10)
         let click_request = Request {
             id: "click-1".to_string(),
             command: Command::Click {
-                ref_id: first_ref.clone(),
+                row: 5,
+                col: 10,
                 session: Some("click-test".to_string()),
             },
         };
@@ -2009,37 +1762,15 @@ mod tests {
             click_response
         );
 
-        // Test clicking an invalid ref
-        let bad_click_request = Request {
-            id: "click-2".to_string(),
-            command: Command::Click {
-                ref_id: "@e999".to_string(),
-                session: Some("click-test".to_string()),
-            },
-        };
-        let bad_click_json = serde_json::to_string(&bad_click_request).unwrap();
-        writer
-            .write_all(bad_click_json.as_bytes())
-            .await
-            .expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        response_line.clear();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        let bad_click_response: Response =
-            serde_json::from_str(&response_line).expect("parse bad click response");
-        assert!(
-            !bad_click_response.success,
-            "Click on invalid ref should fail"
-        );
-        // Verify error has suggestion
-        if let Some(err) = &bad_click_response.error {
-            assert!(err.suggestion.is_some(), "Error should have a suggestion");
+        // Verify the response message contains coordinates
+        if let Some(ResponseData::Ok { message }) = &click_response.data {
+            assert!(
+                message.contains("row 5") && message.contains("col 10"),
+                "Response should contain coordinates: {}",
+                message
+            );
+        } else {
+            panic!("Expected Ok response, got: {:?}", click_response.data);
         }
 
         server_handle.abort();

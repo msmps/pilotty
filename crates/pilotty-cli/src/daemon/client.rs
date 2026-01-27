@@ -162,7 +162,7 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::DaemonServer;
+    use crate::daemon::server::DaemonServer;
     use pilotty_core::protocol::Command;
 
     #[tokio::test]

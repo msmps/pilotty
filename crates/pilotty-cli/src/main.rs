@@ -9,7 +9,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::args::{Cli, Commands};
-use crate::daemon::{DaemonClient, DaemonServer};
+use crate::daemon::client::DaemonClient;
+use crate::daemon::server::DaemonServer;
 
 fn main() {
     // Initialize tracing
@@ -64,7 +65,8 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
             session: args.session.clone(),
         }),
         Commands::Click(args) => Some(Command::Click {
-            ref_id: args.ref_id.clone(),
+            row: args.row,
+            col: args.col,
             session: args.session.clone(),
         }),
         Commands::Scroll(args) => Some(Command::Scroll {

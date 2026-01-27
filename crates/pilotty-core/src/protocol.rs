@@ -38,9 +38,10 @@ pub enum Command {
         key: String,
         session: Option<String>,
     },
-    /// Click an interactive region by ref.
+    /// Click at a specific row/column coordinate.
     Click {
-        ref_id: String,
+        row: u16,
+        col: u16,
         session: Option<String>,
     },
     /// Scroll the terminal.

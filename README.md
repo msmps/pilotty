@@ -12,7 +12,8 @@
 <p align="center">
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#commands">Commands</a>
+  <a href="#commands">Commands</a> •
+  <a href="#usage-with-ai-agents">AI Agents</a>
 </p>
 
 ---
@@ -20,13 +21,12 @@
 > [!NOTE]
 > **Built with AI, for AI.** This project was built with the support of an AI agent, planned thoroughly with a tight feedback loop and reviewed at each step. While we've tested extensively, edge cases may exist. Use in production at your own discretion, and please [report any issues](https://github.com/msmps/pilotty/issues) you find!
 
-pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, parses terminal output, detects interactive UI elements, and provides stable references for clicking buttons, checkboxes, and menu items.
+pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, captures terminal output, and provides keyboard/mouse input capabilities for navigating TUI applications.
 
 ## Features
 
 - **PTY Management**: Spawn and manage terminal applications in background sessions
-- **Region Detection**: Automatically detect buttons, checkboxes, menu items, dialog boxes
-- **Stable Refs**: Interactive elements get stable `@e1`, `@e2` references that persist across snapshots
+- **Keyboard Navigation**: Interact with TUIs using Tab, Enter, arrow keys, and key combos
 - **AI-Friendly Output**: Clean JSON responses with actionable suggestions on errors
 - **Multi-Session**: Run multiple terminal apps simultaneously in isolated sessions
 - **Zero Config**: Daemon auto-starts on first command, auto-stops after 5 minutes idle
@@ -78,8 +78,8 @@ pilotty type "hello world"
 pilotty key Enter
 pilotty key Ctrl+C
 
-# Click an interactive region by ref
-pilotty click @e1
+# Click at specific coordinates (row, col)
+pilotty click 10 5
 
 # List active sessions
 pilotty list-sessions
@@ -94,7 +94,7 @@ pilotty stop
 
 ```bash
 pilotty spawn <command>           # Spawn a TUI app (e.g., pilotty spawn vim file.txt)
-pilotty spawn <cmd> --name myapp  # Spawn with a custom session name
+pilotty spawn --name myapp <cmd>  # Spawn with a custom session name
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
@@ -106,7 +106,7 @@ pilotty examples                  # Show end-to-end workflow example
 ### Screen Capture
 
 ```bash
-pilotty snapshot                  # Full JSON with regions and text
+pilotty snapshot                  # Full JSON with text
 pilotty snapshot --format compact # JSON without text field
 pilotty snapshot --format text    # Plain text with cursor indicator
 ```
@@ -126,7 +126,7 @@ pilotty key Escape                # Send Escape
 ### Interaction
 
 ```bash
-pilotty click @e1                 # Click region by ref
+pilotty click 10 5                # Click at row 10, col 5
 pilotty scroll up                 # Scroll up 1 line
 pilotty scroll down 5             # Scroll down 5 lines
 ```
@@ -149,67 +149,23 @@ The `snapshot` command returns structured data about the terminal screen:
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "regions": [
-    {
-      "ref_id": "@e1",
-      "bounds": { "x": 10, "y": 5, "width": 6, "height": 1 },
-      "region_type": "button",
-      "text": "[ OK ]",
-      "focused": false
-    },
-    {
-      "ref_id": "@e2",
-      "bounds": { "x": 20, "y": 5, "width": 10, "height": 1 },
-      "region_type": "button",
-      "text": "[ Cancel ]",
-      "focused": false
-    }
-  ],
   "text": "... plain text content ..."
 }
 ```
 
-### Region Types
-
-pilotty automatically detects:
-
-| Type | Example | Detection |
-|------|---------|-----------|
-| `button` | `[ OK ]`, `< Save >` | Bracketed text with padding |
-| `checkbox` | `[x] Enable`, `[ ] Disable` | Square brackets with x or space |
-| `radio_button` | `(*) Option`, `( ) Other` | Parentheses with * or space |
-| `menu_item` | `(F)ile`, highlighted text | Shortcut pattern or inverse video |
-| `link` | Underlined text | Underline attribute |
-| `text_input` | Dialog input fields | Box-drawing characters |
-| `scrollable_area` | Scroll regions | Detected contextually |
-| `unknown` | Unclassified boxes | Box detected but no pattern match |
-
-### Stable Refs
-
-Region refs (`@e1`, `@e2`, etc.) are stable across snapshots when the content and position are similar. This allows agents to:
-
-1. Take a snapshot, identify `@e1` as the OK button
-2. Perform other operations
-3. Click `@e1` without re-scanning
-
-```bash
-pilotty snapshot           # "@e1" is [ OK ]
-pilotty type "some text"
-pilotty click @e1          # Still works!
-```
+Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
 
 ## Sessions
 
 Each session is an isolated terminal with its own:
 - PTY (pseudo-terminal)
 - Screen buffer
-- Region tracker
 - Child process
 
 ```bash
-# Run multiple apps
-pilotty spawn htop --name monitoring
-pilotty spawn vim file.txt --name editor
+# Run multiple apps (--name must come before the command)
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim file.txt
 
 # Target specific session
 pilotty snapshot -s monitoring
@@ -225,9 +181,11 @@ Note: The first session spawned without `--name` is automatically named `default
 To run multiple sessions, give each a unique name with `--name`:
 
 ```bash
-pilotty spawn htop --name monitoring
-pilotty spawn vim --name editor
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim
 ```
+
+> **Important:** The `--name` flag must come **before** the command. Everything after the command is passed as arguments to that command.
 
 ## Daemon Architecture
 
@@ -285,14 +243,6 @@ All errors include AI-friendly suggestions:
 }
 ```
 
-```json
-{
-  "code": "REF_NOT_FOUND",
-  "message": "Region '@e5' not found",
-  "suggestion": "Run 'pilotty snapshot' to get updated refs. Available: @e1 ([ OK ]), @e2 ([ Cancel ])"
-}
-```
-
 ## Environment Variables
 
 | Variable | Description |
@@ -301,9 +251,45 @@ All errors include AI-friendly suggestions:
 | `PILOTTY_SOCKET_DIR` | Override socket directory |
 | `RUST_LOG` | Logging level (e.g., `debug`, `info`) |
 
-## AI Agent Workflow
+## Usage with AI Agents
 
-Recommended workflow for AI agents:
+### AI Coding Assistants
+
+Add the skill to your AI coding assistant for richer context:
+
+```bash
+npx skills add msmps/pilotty
+```
+
+This works with Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, Goose, OpenCode, and Windsurf.
+
+### Just Ask the Agent
+
+The simplest approach - just tell your agent to use it:
+
+```
+Use pilotty to interact with vim. Run pilotty --help to see available commands.
+```
+
+The `--help` output is comprehensive and most agents can figure it out from there.
+
+### AGENTS.md / CLAUDE.md
+
+For more consistent results, add to your project or global instructions file:
+
+```markdown
+## Terminal Automation
+
+Use `pilotty` for TUI automation. Run `pilotty --help` for all commands.
+
+Core workflow:
+1. `pilotty spawn <command>` - Start a TUI application
+2. `pilotty snapshot` - Get screen state with cursor position
+3. `pilotty key Tab` / `pilotty type "text"` - Navigate and interact
+4. Re-snapshot after screen changes
+```
+
+### Example Workflow
 
 ```bash
 # 1. Spawn the application
@@ -313,17 +299,16 @@ pilotty spawn vim myfile.txt
 pilotty wait-for "myfile.txt"
 
 # 3. Take a snapshot to understand the screen
-pilotty snapshot --format full
+pilotty snapshot
 
-# 4. Parse the JSON, identify interactive elements
-# 5. Perform actions using refs
+# 4. Navigate using keyboard commands
 pilotty key i                    # Enter insert mode
 pilotty type "Hello, World!"
 pilotty key Escape
 pilotty type ":wq"
 pilotty key Enter
 
-# 6. Take another snapshot if needed
+# 5. Re-snapshot after screen changes
 pilotty snapshot
 ```
 

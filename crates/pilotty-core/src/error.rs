@@ -8,7 +8,6 @@ use std::fmt;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     SessionNotFound,
-    RefNotFound,
     CommandFailed,
     InvalidInput,
     InternalError,
@@ -18,7 +17,6 @@ impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ErrorCode::SessionNotFound => write!(f, "SESSION_NOT_FOUND"),
-            ErrorCode::RefNotFound => write!(f, "REF_NOT_FOUND"),
             ErrorCode::CommandFailed => write!(f, "COMMAND_FAILED"),
             ErrorCode::InvalidInput => write!(f, "INVALID_INPUT"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
@@ -52,30 +50,6 @@ impl ApiError {
             code: ErrorCode::SessionNotFound,
             message: format!("Session '{}' not found", session_id),
             suggestion: Some("Run 'pilotty list-sessions' to see available sessions".into()),
-        }
-    }
-
-    pub fn ref_not_found(ref_id: &str, available: &[String]) -> Self {
-        let suggestion = if available.is_empty() {
-            "Run 'pilotty snapshot' to detect interactive regions".into()
-        } else {
-            format!(
-                "Run 'pilotty snapshot' to get updated refs. Available: {}",
-                available.join(", ")
-            )
-        };
-        Self {
-            code: ErrorCode::RefNotFound,
-            message: format!("Ref '{}' not found", ref_id),
-            suggestion: Some(suggestion),
-        }
-    }
-
-    pub fn ref_not_found_with_suggestion(ref_id: &str, suggestion: &str) -> Self {
-        Self {
-            code: ErrorCode::RefNotFound,
-            message: format!("Ref '{}' not found", ref_id),
-            suggestion: Some(suggestion.to_string()),
         }
     }
 
@@ -224,23 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_not_found_with_available_refs() {
-        let available = vec!["@e1".to_string(), "@e2".to_string()];
-        let err = ApiError::ref_not_found("@e99", &available);
-        assert_has_suggestion(&err, "ref_not_found");
-        let suggestion = err.suggestion.as_ref().unwrap();
-        assert!(suggestion.contains("@e1"));
-        assert!(suggestion.contains("@e2"));
-    }
-
-    #[test]
-    fn test_ref_not_found_empty_refs() {
-        let err = ApiError::ref_not_found("@e1", &[]);
-        assert_has_suggestion(&err, "ref_not_found (empty)");
-        assert!(err.suggestion.as_ref().unwrap().contains("snapshot"));
-    }
-
-    #[test]
     fn test_command_failed_has_suggestion() {
         let err = ApiError::command_failed("something broke");
         assert_has_suggestion(&err, "command_failed");
@@ -340,14 +297,14 @@ mod tests {
 
     #[test]
     fn test_json_serialization() {
-        let err = ApiError::ref_not_found("@e5", &["@e1".to_string()]);
+        let err = ApiError::session_not_found("test-session");
         let json = serde_json::to_string(&err).unwrap();
 
         // Verify all fields are present
         assert!(json.contains("\"code\""));
         assert!(json.contains("\"message\""));
         assert!(json.contains("\"suggestion\""));
-        assert!(json.contains("REF_NOT_FOUND"));
+        assert!(json.contains("SESSION_NOT_FOUND"));
     }
 
     #[test]

@@ -11,13 +11,12 @@
 
 ---
 
-pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, parses terminal output, detects interactive UI elements, and provides stable references for clicking buttons, checkboxes, and menu items.
+pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, captures terminal output, and provides keyboard/mouse input capabilities for navigating TUI applications.
 
 ## Features
 
 - **PTY Management**: Spawn and manage terminal applications in background sessions
-- **Region Detection**: Automatically detect buttons, checkboxes, menu items, dialog boxes
-- **Stable Refs**: Interactive elements get stable `@e1`, `@e2` references that persist across snapshots
+- **Keyboard Navigation**: Interact with TUIs using Tab, Enter, arrow keys, and key combos
 - **AI-Friendly Output**: Clean JSON responses with actionable suggestions on errors
 - **Multi-Session**: Run multiple terminal apps simultaneously in isolated sessions
 - **Zero Config**: Daemon auto-starts on first command, auto-stops after 5 minutes idle
@@ -44,8 +43,8 @@ pilotty type "hello world"
 pilotty key Enter
 pilotty key Ctrl+C
 
-# Click an interactive region by ref
-pilotty click @e1
+# Click at specific coordinates (row, col)
+pilotty click 10 5
 
 # List active sessions
 pilotty list-sessions
@@ -75,18 +74,11 @@ The `snapshot` command returns structured data about the terminal screen:
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "regions": [
-    {
-      "ref_id": "@e1",
-      "bounds": { "x": 10, "y": 5, "width": 6, "height": 1 },
-      "region_type": "button",
-      "text": "[ OK ]",
-      "focused": false
-    }
-  ],
   "text": "... plain text content ..."
 }
 ```
+
+Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
 
 ## Building from Source
 
@@ -101,7 +93,7 @@ Requires [Rust](https://rustup.rs) 1.70+.
 
 ## Documentation
 
-See the [GitHub repository](https://github.com/msmps/pilotty) for full documentation including all commands, region types, key combinations, and AI agent workflow examples.
+See the [GitHub repository](https://github.com/msmps/pilotty) for full documentation including all commands, key combinations, and AI agent workflow examples.
 
 ## License
 
