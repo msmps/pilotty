@@ -2,11 +2,22 @@
 
 pilotty manages multiple isolated terminal sessions, each running its own TUI application with independent state.
 
-> **Important:** When using `--name`, it must come **before** the command:
-> ```bash
-> pilotty spawn --name myapp vim file.txt   # Correct
-> pilotty spawn vim file.txt --name myapp   # Wrong (--name passed to vim)
-> ```
+## CRITICAL: Flag Positioning
+
+**All flags MUST come BEFORE positional arguments.** This applies to `--name`, `-s`/`--session`, and all other options:
+
+```bash
+# CORRECT
+pilotty spawn --name myapp vim file.txt
+pilotty key -s myapp Enter
+pilotty snapshot -s myapp --format text
+
+# WRONG - flags after positional args get passed to the command, not pilotty
+pilotty spawn vim file.txt --name myapp   # --name goes to vim, session uses "default"
+pilotty key Enter -s myapp                # -s is ignored, targets wrong session
+```
+
+---
 
 ## Session Basics
 

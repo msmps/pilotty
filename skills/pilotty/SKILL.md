@@ -6,6 +6,25 @@ allowed-tools: Bash(pilotty:*)
 
 # Terminal Automation with pilotty
 
+## CRITICAL: Argument Positioning
+
+**All flags (`--name`, `-s`, `--format`, etc.) MUST come BEFORE positional arguments:**
+
+```bash
+# CORRECT - flags before command/arguments
+pilotty spawn --name myapp vim file.txt
+pilotty key -s myapp Enter
+pilotty snapshot -s myapp --format text
+
+# WRONG - flags after command (they get passed to the app, not pilotty!)
+pilotty spawn vim file.txt --name myapp   # FAILS: --name goes to vim
+pilotty key Enter -s myapp                # FAILS: -s goes nowhere useful
+```
+
+This is the #1 cause of agent failures. When in doubt: **flags first, then command/args**.
+
+---
+
 ## Quick start
 
 ```bash
@@ -25,8 +44,6 @@ pilotty kill                      # End session
 3. **Snapshot**: `pilotty snapshot` returns screen state with text content and cursor position
 4. **Interact**: Use keyboard commands (`key`, `type`) or click at coordinates (`click <row> <col>`)
 5. **Re-snapshot**: After screen changes, snapshot again to see updated state
-
-**Critical**: Use `--name` before the command: `pilotty spawn --name myapp vim`
 
 ## Commands
 
