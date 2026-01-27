@@ -11,8 +11,10 @@ allowed-tools: Bash(pilotty:*)
 ```bash
 pilotty spawn vim file.txt        # Start TUI app in managed session
 pilotty wait-for "file.txt"       # Wait for app to be ready
-pilotty snapshot                  # Get screen state with refs
-pilotty click @e1                 # Click element by ref
+pilotty snapshot                  # Get screen state with cursor position
+pilotty key i                     # Enter insert mode
+pilotty type "Hello, World!"      # Type text
+pilotty key Escape                # Exit insert mode
 pilotty kill                      # End session
 ```
 
@@ -20,11 +22,11 @@ pilotty kill                      # End session
 
 1. **Spawn**: `pilotty spawn <command>` starts the app in a background PTY
 2. **Wait**: `pilotty wait-for <text>` ensures the app is ready
-3. **Snapshot**: `pilotty snapshot` returns screen state with interactive regions as refs (`@e1`, `@e2`)
-4. **Interact**: Use refs to click elements, or use `type`/`key` for input
-5. **Re-snapshot**: After significant screen changes, snapshot again to get updated refs
+3. **Snapshot**: `pilotty snapshot` returns screen state with text content and cursor position
+4. **Interact**: Use keyboard commands (`key`, `type`) or click at coordinates (`click <row> <col>`)
+5. **Re-snapshot**: After screen changes, snapshot again to see updated state
 
-**Critical**: Refs are tied to screen state. Re-snapshot after navigation or content changes.
+**Critical**: Use `--name` before the command: `pilotty spawn --name myapp vim`
 
 ## Commands
 
@@ -32,7 +34,7 @@ pilotty kill                      # End session
 
 ```bash
 pilotty spawn <command>           # Start TUI app (e.g., pilotty spawn htop)
-pilotty spawn <cmd> --name myapp  # Start with custom session name
+pilotty spawn --name myapp <cmd>  # Start with custom session name (--name before command)
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
@@ -44,9 +46,9 @@ pilotty examples                  # Show end-to-end workflow example
 ### Screen capture
 
 ```bash
-pilotty snapshot                  # Full JSON with regions and text
-pilotty snapshot --format compact # Compact format with inline refs
-pilotty snapshot --format text    # Plain text only, no metadata
+pilotty snapshot                  # Full JSON with text content
+pilotty snapshot --format compact # JSON without text field
+pilotty snapshot --format text    # Plain text with cursor indicator
 pilotty snapshot -s myapp         # Snapshot specific session
 ```
 
@@ -69,8 +71,8 @@ pilotty key -s myapp Ctrl+S       # Key in specific session
 ### Interaction
 
 ```bash
-pilotty click @e1                 # Click region by ref
-pilotty click -s myapp @e3        # Click in specific session
+pilotty click 5 10                # Click at row 5, col 10
+pilotty click -s myapp 10 20      # Click in specific session
 pilotty scroll up                 # Scroll up 1 line
 pilotty scroll down 5             # Scroll down 5 lines
 pilotty scroll up 10 -s myapp     # Scroll in specific session
@@ -115,51 +117,42 @@ The `snapshot` command returns structured JSON:
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "regions": [
-    {
-      "ref_id": "@e1",
-      "bounds": { "x": 10, "y": 5, "width": 6, "height": 1 },
-      "region_type": "button",
-      "text": "[ OK ]",
-      "focused": false
-    }
-  ],
   "text": "... plain text content ..."
 }
 ```
 
-### Region types
+Use `--format text` for a plain text view with cursor indicator:
 
-pilotty automatically detects these interactive elements:
-
-| Type | Pattern | Example |
-|------|---------|---------|
-| `button` | Bracketed text | `[ OK ]`, `< Save >` |
-| `checkbox` | Square brackets with x/space | `[x] Enable`, `[ ] Disable` |
-| `radio_button` | Parens with */space | `(*) Option`, `( ) Other` |
-| `menu_item` | Shortcut or inverse video | `(F)ile`, highlighted text |
-| `link` | Underlined text | URLs, clickable references |
-| `text_input` | Box-drawn input fields | Dialog text inputs |
-| `scrollable_area` | Scroll regions | Detected contextually |
-| `unknown` | Unclassified boxes | Bordered regions |
-
-## Using refs
-
-Refs (`@e1`, `@e2`, etc.) are stable identifiers for interactive elements.
-
-```bash
-# 1. Get snapshot with refs
-pilotty snapshot
-# Output includes: "@e1" [button] "[ OK ]", "@e2" [button] "[ Cancel ]"
-
-# 2. Click by ref
-pilotty click @e1
-
-# 3. Re-snapshot if screen changed
-pilotty snapshot
+```
+--- Terminal 80x24 | Cursor: (5, 10) ---
+bash-3.2$ [_]
 ```
 
-**Ref stability**: Refs persist when content/position are similar. After major screen changes (navigation, new dialog), re-snapshot to get fresh refs.
+The `[_]` shows cursor position. Use the text content to understand screen state and navigate with keyboard commands.
+
+## Navigation approach
+
+pilotty uses keyboard-first navigation, just like a human would:
+
+```bash
+# 1. Take snapshot to see the screen
+pilotty snapshot --format text
+
+# 2. Navigate using keyboard
+pilotty key Tab           # Move to next element
+pilotty key Enter         # Activate/select
+pilotty key Escape        # Cancel/back
+pilotty key Up            # Move up in list/menu
+
+# 3. Type text when needed
+pilotty type "search term"
+pilotty key Enter
+
+# 4. Click at coordinates for mouse-enabled TUIs
+pilotty click 5 10        # Click at row 5, col 10
+```
+
+**Key insight**: Parse the snapshot text to understand what's on screen, then use keyboard commands to navigate. This works reliably across all TUI applications.
 
 ## Example: Edit file with vim
 
@@ -190,19 +183,19 @@ pilotty list-sessions
 ## Example: Dialog interaction
 
 ```bash
-# 1. Spawn dialog
-pilotty spawn dialog --yesno "Continue?" 10 40
+# 1. Spawn dialog (--name before command)
+pilotty spawn --name dialog dialog --yesno "Continue?" 10 40
 
-# 2. Get snapshot to see buttons
-pilotty snapshot
-# Output: @e1 [button] "< Yes >", @e2 [button] "< No >"
+# 2. Get snapshot to see the dialog
+pilotty snapshot -s dialog --format text
+# Shows: < Yes > and < No > buttons
 
-# 3. Click Yes
-pilotty click @e1
+# 3. Navigate with keyboard
+pilotty key -s dialog Tab      # Move to next button
+pilotty key -s dialog Enter    # Activate selected button
 
-# Or navigate with keys
-pilotty key Tab      # Move to next button
-pilotty key Enter    # Activate
+# Or click at coordinates if you know the button position
+pilotty click -s dialog 8 15   # Click at row 8, col 15
 ```
 
 ## Example: Monitor with htop
@@ -230,13 +223,12 @@ pilotty kill -s monitor
 Each session is isolated with its own:
 - PTY (pseudo-terminal)
 - Screen buffer
-- Region tracker
 - Child process
 
 ```bash
-# Run multiple apps
-pilotty spawn htop --name monitoring
-pilotty spawn vim file.txt --name editor
+# Run multiple apps (--name must come before the command)
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim file.txt
 
 # Target specific session
 pilotty snapshot -s monitoring
@@ -250,6 +242,8 @@ pilotty kill -s editor
 ```
 
 The first session spawned without `--name` is automatically named `default`.
+
+> **Important:** The `--name` flag must come **before** the command. Everything after the command is passed as arguments to that command.
 
 ## Daemon architecture
 

@@ -34,8 +34,8 @@ Examples:
     #[command(after_help = "\
 Examples:
   pilotty snapshot                      # Snapshot default session (full JSON)
-  pilotty snapshot --format compact     # Compact format with inline refs
-  pilotty snapshot --format text        # Plain text only, no metadata
+  pilotty snapshot --format compact     # JSON without text field
+  pilotty snapshot --format text        # Plain text with cursor indicator
   pilotty snapshot -s editor            # Snapshot a specific session")]
     Snapshot(SnapshotArgs),
 

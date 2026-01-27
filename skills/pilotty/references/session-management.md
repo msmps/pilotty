@@ -2,12 +2,17 @@
 
 pilotty manages multiple isolated terminal sessions, each running its own TUI application with independent state.
 
+> **Important:** When using `--name`, it must come **before** the command:
+> ```bash
+> pilotty spawn --name myapp vim file.txt   # Correct
+> pilotty spawn vim file.txt --name myapp   # Wrong (--name passed to vim)
+> ```
+
 ## Session Basics
 
 Each session has:
 - **PTY**: Pseudo-terminal for the application
 - **Screen buffer**: Terminal emulator state
-- **Region tracker**: Detected interactive elements and refs
 - **Child process**: The running application
 
 ## Creating Sessions
@@ -26,12 +31,12 @@ pilotty snapshot
 
 ### Named Sessions
 
-Use `--name` for multiple concurrent sessions:
+Use `--name` for multiple concurrent sessions. **Note:** `--name` must come before the command:
 
 ```bash
-pilotty spawn htop --name monitoring
-pilotty spawn vim file.txt --name editor
-pilotty spawn lazygit --name git
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim file.txt
+pilotty spawn --name git lazygit
 ```
 
 ### Session Naming Rules
@@ -94,15 +99,14 @@ pilotty spawn --name myapp my-command arg1 arg2
 
 While a session is active:
 - Screen buffer updates on process output
-- Regions are re-detected on significant changes
-- Refs remain stable until screen changes
+- Cursor position is tracked
+- Terminal size can be changed with `resize`
 
 ### Process Exit
 
 When the child process exits:
 - Session is marked for cleanup
 - Cleanup happens within 500ms
-- Refs become invalid
 - Session is removed from list
 
 ### Manual Kill
@@ -120,10 +124,10 @@ Sends SIGTERM to the child process, then cleans up.
 Run multiple apps and switch between them:
 
 ```bash
-# Start apps
-pilotty spawn htop --name cpu
-pilotty spawn iotop --name io
-pilotty spawn nethogs --name net
+# Start apps (--name before command)
+pilotty spawn --name cpu htop
+pilotty spawn --name io iotop
+pilotty spawn --name net nethogs
 
 # Check each
 pilotty snapshot -s cpu --format text
@@ -141,11 +145,11 @@ pilotty kill -s net
 Edit a file while watching output:
 
 ```bash
-# Start editor
-pilotty spawn vim main.py --name editor
+# Start editor (--name before command)
+pilotty spawn --name editor vim main.py
 
 # Start file watcher
-pilotty spawn watch -n1 python main.py --name preview
+pilotty spawn --name preview watch -n1 python main.py
 
 # Edit
 pilotty key -s editor i
@@ -163,8 +167,8 @@ pilotty snapshot -s preview --format text
 Sequential operations across sessions:
 
 ```bash
-# Setup
-pilotty spawn bash --name worker
+# Setup (--name before command)
+pilotty spawn --name worker bash
 
 # Run commands
 pilotty type -s worker "curl -s https://api.example.com > data.json"
@@ -184,13 +188,13 @@ pilotty snapshot -s worker --format text
 Sessions are fully isolated:
 - Separate PTY file descriptors
 - Independent screen buffers
-- Separate ref numbering per session
+- Independent cursor positions
 - No shared state between sessions
 
 This means:
-- `@e1` in session A is unrelated to `@e1` in session B
 - Killing session A doesn't affect session B
 - Each session can have different terminal sizes
+- Snapshots from one session don't affect others
 
 ## Daemon Lifecycle
 
@@ -264,8 +268,9 @@ Attempting to spawn with a name that's already in use:
 
 ## Best Practices
 
-1. **Use meaningful names**: `--name editor` is better than `--name s1`
-2. **Clean up when done**: Kill sessions you're finished with
-3. **Don't rely on default**: For multi-session work, always name your sessions
-4. **Check session exists**: Use `list-sessions` before targeting
-5. **Handle process exit**: Sessions auto-cleanup, but check if your command is still running
+1. **Put --name before command**: `pilotty spawn --name myapp cmd` (not after)
+2. **Use meaningful names**: `--name editor` is better than `--name s1`
+3. **Clean up when done**: Kill sessions you're finished with
+4. **Don't rely on default**: For multi-session work, always name your sessions
+5. **Check session exists**: Use `list-sessions` before targeting
+6. **Handle process exit**: Sessions auto-cleanup, but check if your command is still running

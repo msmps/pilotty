@@ -94,7 +94,7 @@ pilotty stop
 
 ```bash
 pilotty spawn <command>           # Spawn a TUI app (e.g., pilotty spawn vim file.txt)
-pilotty spawn <cmd> --name myapp  # Spawn with a custom session name
+pilotty spawn --name myapp <cmd>  # Spawn with a custom session name
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
@@ -163,9 +163,9 @@ Each session is an isolated terminal with its own:
 - Child process
 
 ```bash
-# Run multiple apps
-pilotty spawn htop --name monitoring
-pilotty spawn vim file.txt --name editor
+# Run multiple apps (--name must come before the command)
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim file.txt
 
 # Target specific session
 pilotty snapshot -s monitoring
@@ -181,9 +181,11 @@ Note: The first session spawned without `--name` is automatically named `default
 To run multiple sessions, give each a unique name with `--name`:
 
 ```bash
-pilotty spawn htop --name monitoring
-pilotty spawn vim --name editor
+pilotty spawn --name monitoring htop
+pilotty spawn --name editor vim
 ```
+
+> **Important:** The `--name` flag must come **before** the command. Everything after the command is passed as arguments to that command.
 
 ## Daemon Architecture
 
