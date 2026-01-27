@@ -20,6 +20,12 @@ pub enum Command {
     Spawn {
         command: Vec<String>,
         session_name: Option<String>,
+        /// Working directory for the spawned process.
+        ///
+        /// If provided, the command runs in this directory. The path must be
+        /// an existing directory. If not provided, the process inherits the
+        /// daemon's working directory.
+        cwd: Option<String>,
     },
     /// Kill a session.
     Kill { session: Option<String> },

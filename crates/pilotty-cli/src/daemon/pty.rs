@@ -41,7 +41,10 @@ pub struct PtySession {
 
 impl PtySession {
     /// Spawn a command in a new PTY session.
-    pub fn spawn(command: &[String], size: TermSize) -> Result<Self> {
+    ///
+    /// If `cwd` is provided, the command will run in that directory.
+    /// Otherwise, it inherits the daemon's current directory.
+    pub fn spawn(command: &[String], size: TermSize, cwd: Option<&str>) -> Result<Self> {
         if command.is_empty() {
             anyhow::bail!("Command cannot be empty");
         }
@@ -54,6 +57,9 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(&command[0]);
         if command.len() > 1 {
             cmd.args(&command[1..]);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
         }
 
         let child = pair
@@ -349,6 +355,7 @@ mod tests {
         let session = PtySession::spawn(
             &["echo".to_string(), "hello".to_string()],
             TermSize::default(),
+            None,
         )
         .expect("Failed to spawn echo");
 
@@ -394,7 +401,7 @@ mod tests {
     #[test]
     fn test_spawn_and_write_input() {
         // Spawn cat which echoes input
-        let session = PtySession::spawn(&["cat".to_string()], TermSize::default())
+        let session = PtySession::spawn(&["cat".to_string()], TermSize::default(), None)
             .expect("Failed to spawn cat");
 
         let mut writer = session.writer().expect("Failed to get writer");
@@ -439,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_pty_bash_exit() {
         // Spawn bash
-        let session = PtySession::spawn(&["bash".to_string()], TermSize::default())
+        let session = PtySession::spawn(&["bash".to_string()], TermSize::default(), None)
             .expect("Failed to spawn bash");
 
         let handle = AsyncPtyHandle::new(session).expect("Failed to create async handle");
@@ -483,8 +490,8 @@ mod tests {
     #[tokio::test]
     async fn test_async_pty_handle_resize() {
         // Spawn a shell
-        let session =
-            PtySession::spawn(&["sh".to_string()], TermSize { cols: 80, rows: 24 }).expect("spawn");
+        let session = PtySession::spawn(&["sh".to_string()], TermSize { cols: 80, rows: 24 }, None)
+            .expect("spawn");
 
         let handle = AsyncPtyHandle::new(session).expect("async handle");
 
@@ -500,5 +507,46 @@ mod tests {
         handle
             .resize(TermSize { cols: 40, rows: 10 })
             .expect("resize to smaller should succeed");
+    }
+
+    #[test]
+    fn test_spawn_with_cwd() {
+        // Spawn pwd in /tmp and verify it outputs a path containing "tmp"
+        // Note: On macOS, /tmp is a symlink to /private/tmp
+        let session = PtySession::spawn(&["pwd".to_string()], TermSize::default(), Some("/tmp"))
+            .expect("Failed to spawn pwd with cwd");
+
+        let mut reader = session.reader().expect("Failed to get reader");
+
+        // Give the process time to write output
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut output = vec![0u8; 256];
+        let mut total_read = 0;
+
+        loop {
+            match reader.read(&mut output[total_read..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total_read += n;
+                    let s = String::from_utf8_lossy(&output[..total_read]);
+                    // Check for tmp (handles both /tmp and /private/tmp on macOS)
+                    if s.contains("tmp") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+
+        let output_str = String::from_utf8_lossy(&output[..total_read]);
+        assert!(
+            output_str.contains("tmp"),
+            "Expected pwd output to contain 'tmp', got: {:?}",
+            output_str
+        );
     }
 }

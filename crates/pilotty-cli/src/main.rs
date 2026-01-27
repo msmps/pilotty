@@ -44,6 +44,7 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         Commands::Spawn(args) => Some(Command::Spawn {
             command: args.command.clone(),
             session_name: args.name.clone(),
+            cwd: args.cwd.clone(),
         }),
         Commands::Kill(args) => Some(Command::Kill {
             session: args.session.clone(),

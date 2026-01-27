@@ -24,6 +24,7 @@ Examples:
   pilotty spawn htop                    # Simple command
   pilotty spawn vim file.txt            # Command with arguments
   pilotty spawn --name editor vim       # Named session for easy reference
+  pilotty spawn --cwd /tmp bash         # Start bash in /tmp directory
   pilotty spawn bash -c 'echo hello'    # Shell command with args")]
     Spawn(SpawnArgs),
 
@@ -118,6 +119,11 @@ pub struct SpawnArgs {
     /// Give this session a human-readable name
     #[arg(short, long)]
     pub name: Option<String>,
+
+    /// Working directory for the spawned process.
+    /// If omitted, inherits the daemon's current directory.
+    #[arg(long, value_name = "DIR")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

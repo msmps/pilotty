@@ -95,6 +95,7 @@ pilotty stop
 ```bash
 pilotty spawn <command>           # Spawn a TUI app (e.g., pilotty spawn vim file.txt)
 pilotty spawn --name myapp <cmd>  # Spawn with a custom session name
+pilotty spawn --cwd /path cmd     # Spawn in a specific working directory
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
@@ -166,6 +167,9 @@ Each session is an isolated terminal with its own:
 # Run multiple apps (--name must come before the command)
 pilotty spawn --name monitoring htop
 pilotty spawn --name editor vim file.txt
+
+# Run app in a specific directory (useful for project-specific configs)
+pilotty spawn --cwd /path/to/project --name myapp bun src/index.tsx
 
 # Target specific session
 pilotty snapshot -s monitoring

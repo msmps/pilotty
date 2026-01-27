@@ -501,7 +501,8 @@ async fn handle_request(
         Command::Spawn {
             command,
             session_name,
-        } => handle_spawn(&request.id, &sessions, command, session_name).await,
+            cwd,
+        } => handle_spawn(&request.id, &sessions, command, session_name, cwd).await,
 
         Command::Snapshot { session, format } => {
             handle_snapshot(&request.id, &sessions, session, format).await
@@ -548,6 +549,7 @@ async fn handle_spawn(
     sessions: &SessionManager,
     command: Vec<String>,
     session_name: Option<String>,
+    cwd: Option<String>,
 ) -> Response {
     if command.is_empty() {
         return Response::error(
@@ -559,8 +561,31 @@ async fn handle_spawn(
         );
     }
 
+    // Validate cwd if provided
+    if let Some(ref dir) = cwd {
+        let path = std::path::Path::new(dir);
+        if !path.exists() {
+            return Response::error(
+                request_id,
+                ApiError::invalid_input_with_suggestion(
+                    format!("Working directory '{}' does not exist", dir),
+                    "Provide an existing directory path, or omit --cwd to use the daemon's directory",
+                ),
+            );
+        }
+        if !path.is_dir() {
+            return Response::error(
+                request_id,
+                ApiError::invalid_input_with_suggestion(
+                    format!("'{}' is not a directory", dir),
+                    "The --cwd option requires a directory path, not a file",
+                ),
+            );
+        }
+    }
+
     match sessions
-        .create_session(command.clone(), session_name, None)
+        .create_session(command.clone(), session_name, None, cwd)
         .await
     {
         Ok(id) => {
@@ -1293,6 +1318,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "hello from test".to_string()],
                 session_name: Some("test-snap".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1395,6 +1421,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "full format test".to_string()],
                 session_name: Some("full-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1508,6 +1535,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
                 session_name: Some("type-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1622,6 +1650,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
                 session_name: Some("key-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1721,6 +1750,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
                 session_name: Some("click-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1815,6 +1845,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
                 session_name: Some("scroll-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1919,6 +1950,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "hello world marker".to_string()],
                 session_name: Some("waitfor-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2009,6 +2041,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "version 1.2.3 ready".to_string()],
                 session_name: Some("waitfor-re-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2098,6 +2131,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
                 session_name: Some("waitfor-to-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2185,6 +2219,7 @@ mod tests {
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "test".to_string()],
                 session_name: Some("waitfor-bad-test".to_string()),
+                cwd: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2242,5 +2277,74 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_invalid_cwd_fails() {
+        let temp_dir = std::env::temp_dir();
+        let socket_path = temp_dir.join(format!("pilotty-cwd-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(5), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Try to spawn with nonexistent cwd
+        let spawn_request = Request {
+            id: "spawn-bad-cwd".to_string(),
+            command: Command::Spawn {
+                command: vec!["pwd".to_string()],
+                session_name: Some("bad-cwd-test".to_string()),
+                cwd: Some("/nonexistent/path/that/does/not/exist".to_string()),
+            },
+        };
+        let request_json = serde_json::to_string(&spawn_request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        let spawn_response: Response =
+            serde_json::from_str(&response_line).expect("parse spawn response");
+        assert!(
+            !spawn_response.success,
+            "Spawn with nonexistent cwd should fail"
+        );
+
+        if let Some(err) = &spawn_response.error {
+            assert!(
+                err.message.contains("does not exist"),
+                "Error should mention directory does not exist, got: {}",
+                err.message
+            );
+            assert!(
+                err.suggestion.is_some(),
+                "Should have suggestion for invalid cwd"
+            );
+        }
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
     }
 }

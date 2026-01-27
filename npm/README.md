@@ -33,6 +33,9 @@ npm install -g pilotty
 # Spawn a TUI application
 pilotty spawn htop
 
+# Spawn in a specific working directory
+pilotty spawn --cwd /path/to/project bun src/app.tsx
+
 # Take a snapshot of the terminal
 pilotty snapshot
 
