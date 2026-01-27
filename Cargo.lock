@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "pilotty-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "pilotty-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
