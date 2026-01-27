@@ -56,8 +56,8 @@ pilotty snapshot -s monitoring
 # Send key to specific session
 pilotty key -s editor Ctrl+S
 
-# Click in specific session
-pilotty click -s git @e1
+# Send key in specific session
+pilotty key -s git Enter
 
 # Kill specific session
 pilotty kill -s monitoring

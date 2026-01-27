@@ -31,8 +31,7 @@ pilotty wait-for -s "$SESSION_NAME" "continue" -t 5000
 echo "Snapshot:"
 pilotty snapshot -s "$SESSION_NAME" --format compact
 
-# Click Yes (usually @e1, but verify from snapshot)
-# Using Tab + Enter as a reliable alternative:
+# Select Yes using keyboard (Enter selects the default button)
 pilotty key -s "$SESSION_NAME" Enter  # Select default (Yes)
 
 sleep 0.5

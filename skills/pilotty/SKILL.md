@@ -270,9 +270,9 @@ Errors include actionable suggestions:
 
 ```json
 {
-  "code": "REF_NOT_FOUND",
-  "message": "Region '@e5' not found",
-  "suggestion": "Run 'pilotty snapshot' to get updated refs. Available: @e1, @e2"
+  "code": "SPAWN_FAILED",
+  "message": "Failed to spawn process: command not found",
+  "suggestion": "Check that the command exists and is in PATH"
 }
 ```
 
@@ -290,15 +290,15 @@ pilotty snapshot            # Then snapshot
 
 ```bash
 pilotty snapshot --format text | grep "Error"  # Check for errors
-pilotty click @e1                               # Then proceed
+pilotty key Enter                               # Then proceed
 ```
 
-### Retry on stale ref
+### Retry on timeout
 
 ```bash
-pilotty click @e1 || {
-  pilotty snapshot          # Ref stale, re-snapshot
-  pilotty click @e1         # Retry with fresh ref
+pilotty wait-for "Ready" -t 5000 || {
+  pilotty snapshot --format text   # Check what's on screen
+  # Adjust approach based on actual state
 }
 ```
 
@@ -308,7 +308,6 @@ For detailed patterns and edge cases, see:
 
 | Reference | Description |
 |-----------|-------------|
-| [references/region-refs.md](references/region-refs.md) | Ref lifecycle, invalidation, troubleshooting |
 | [references/session-management.md](references/session-management.md) | Multi-session patterns, isolation, cleanup |
 | [references/key-input.md](references/key-input.md) | Complete key combinations reference |
 
