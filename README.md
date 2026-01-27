@@ -18,7 +18,7 @@
 ---
 
 > [!NOTE]
-> **Built with AI, for AI.** This project was built with the support of an AI agent, planned thoroughly with a tight feedback loop and reviewed at each step. While we've tested extensively (153 tests!), edge cases may exist. Use in production at your own discretion, and please [report any issues](https://github.com/msmps/pilotty/issues) you find!
+> **Built with AI, for AI.** This project was built with the support of an AI agent, planned thoroughly with a tight feedback loop and reviewed at each step. While we've tested extensively, edge cases may exist. Use in production at your own discretion, and please [report any issues](https://github.com/msmps/pilotty/issues) you find!
 
 pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, parses terminal output, detects interactive UI elements, and provides stable references for clicking buttons, checkboxes, and menu items.
 
