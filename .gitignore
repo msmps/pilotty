@@ -1,0 +1,27 @@
+# Rust
+target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Agent/AI tooling
+.opencode/
+.claude/
+
+# Internal docs (not for public repo)
+docs/
+
+# npm - binaries are downloaded during release
+npm/bin/pilotty-*
+npm/node_modules/

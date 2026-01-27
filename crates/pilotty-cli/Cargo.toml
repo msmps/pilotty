@@ -1,0 +1,29 @@
+[package]
+name = "pilotty-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI and daemon for pilotty"
+
+[[bin]]
+name = "pilotty"
+path = "src/main.rs"
+
+[dependencies]
+pilotty-core = { path = "../pilotty-core" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+portable-pty = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+vt100 = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }

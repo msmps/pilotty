@@ -1,0 +1,2 @@
+# Only include bin/ directory (specified in package.json files array)
+# This file is a safety net

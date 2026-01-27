@@ -1,0 +1,41 @@
+{
+  "name": "pilotty",
+  "version": "0.0.1",
+  "description": "AI-friendly terminal automation tool. Enables AI agents to interact with TUI applications through PTY management.",
+  "keywords": [
+    "ai",
+    "agent",
+    "terminal",
+    "tui",
+    "pty",
+    "automation",
+    "cli"
+  ],
+  "author": "Matt Simpson",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/msmps/pilotty.git"
+  },
+  "homepage": "https://github.com/msmps/pilotty",
+  "bugs": {
+    "url": "https://github.com/msmps/pilotty/issues"
+  },
+  "bin": {
+    "pilotty": "./bin/pilotty"
+  },
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

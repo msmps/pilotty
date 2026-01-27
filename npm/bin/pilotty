@@ -1,0 +1,47 @@
+#!/bin/sh
+# pilotty CLI wrapper
+# Detects OS/arch and runs the appropriate native binary
+
+# Resolve symlinks to find the actual script location
+SCRIPT="$0"
+while [ -L "$SCRIPT" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+  SCRIPT="$(readlink "$SCRIPT")"
+  case "$SCRIPT" in /*) ;; *) SCRIPT="$SCRIPT_DIR/$SCRIPT" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+
+# Detect OS and architecture
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS" in
+  darwin) OS="darwin" ;;
+  linux) OS="linux" ;;
+  *)
+    echo "Error: Unsupported operating system: $OS" >&2
+    echo "pilotty only supports macOS and Linux." >&2
+    exit 1
+    ;;
+esac
+
+case "$ARCH" in
+  x86_64|amd64) ARCH="x64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *)
+    echo "Error: Unsupported architecture: $ARCH" >&2
+    echo "pilotty only supports x64 and arm64 architectures." >&2
+    exit 1
+    ;;
+esac
+
+BINARY="$SCRIPT_DIR/pilotty-${OS}-${ARCH}"
+
+if [ -f "$BINARY" ] && [ -x "$BINARY" ]; then
+  exec "$BINARY" "$@"
+fi
+
+echo "Error: No binary found for ${OS}-${ARCH}" >&2
+echo "Expected: $BINARY" >&2
+echo "You can build from source: https://github.com/msmps/pilotty" >&2
+exit 1

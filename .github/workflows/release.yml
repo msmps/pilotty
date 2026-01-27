@@ -1,0 +1,232 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (zigbuild for better glibc compatibility)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            npm_arch: linux-x64
+            use_zigbuild: true
+          # Linux ARM64 (zigbuild for better glibc compatibility)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            npm_arch: linux-arm64
+            use_zigbuild: true
+          # macOS x86_64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            npm_arch: darwin-x64
+          # macOS ARM64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            npm_arch: darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Install cargo-zigbuild for Linux targets (better glibc compatibility)
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Build with zigbuild (Linux)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build with cargo (macOS)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package for GitHub Release
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../pilotty-${{ matrix.target }}.${{ matrix.archive }} pilotty
+          cd ../../..
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pilotty-${{ matrix.target }}
+          path: pilotty-${{ matrix.target }}.${{ matrix.archive }}
+
+      # Also upload the raw binary for npm packaging
+      - name: Upload npm binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.npm_arch }}
+          path: target/${{ matrix.target }}/release/pilotty
+
+  verify-binaries:
+    name: Verify Binaries
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Verify all binaries exist and are valid
+        run: |
+          echo "=== Artifact structure ==="
+          find artifacts -type f | head -20
+
+          # Expected release tarballs
+          EXPECTED_TARBALLS=(
+            "pilotty-x86_64-unknown-linux-gnu/pilotty-x86_64-unknown-linux-gnu.tar.gz"
+            "pilotty-aarch64-unknown-linux-gnu/pilotty-aarch64-unknown-linux-gnu.tar.gz"
+            "pilotty-x86_64-apple-darwin/pilotty-x86_64-apple-darwin.tar.gz"
+            "pilotty-aarch64-apple-darwin/pilotty-aarch64-apple-darwin.tar.gz"
+          )
+
+          # Expected npm binaries
+          EXPECTED_NPM=(
+            "npm-linux-x64/pilotty"
+            "npm-linux-arm64/pilotty"
+            "npm-darwin-x64/pilotty"
+            "npm-darwin-arm64/pilotty"
+          )
+
+          MIN_TARBALL_SIZE=100000  # 100KB minimum for tarballs
+          MIN_BINARY_SIZE=100000   # 100KB minimum for raw binaries
+          ERRORS=0
+
+          echo ""
+          echo "=== Checking release tarballs ==="
+          for tarball in "${EXPECTED_TARBALLS[@]}"; do
+            path="artifacts/$tarball"
+            if [ ! -f "$path" ]; then
+              echo "ERROR: Missing $path"
+              ERRORS=$((ERRORS + 1))
+            else
+              SIZE=$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path")
+              if [ "$SIZE" -lt "$MIN_TARBALL_SIZE" ]; then
+                echo "ERROR: $path is too small ($SIZE bytes, expected >= $MIN_TARBALL_SIZE)"
+                ERRORS=$((ERRORS + 1))
+              else
+                echo "OK: $path ($SIZE bytes)"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "=== Checking npm binaries ==="
+          for binary in "${EXPECTED_NPM[@]}"; do
+            path="artifacts/$binary"
+            if [ ! -f "$path" ]; then
+              echo "ERROR: Missing $path"
+              ERRORS=$((ERRORS + 1))
+            else
+              SIZE=$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path")
+              if [ "$SIZE" -lt "$MIN_BINARY_SIZE" ]; then
+                echo "ERROR: $path is too small ($SIZE bytes, expected >= $MIN_BINARY_SIZE)"
+                ERRORS=$((ERRORS + 1))
+              else
+                echo "OK: $path ($SIZE bytes)"
+              fi
+            fi
+          done
+
+          echo ""
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "FAILED: $ERRORS artifact issues found"
+            exit 1
+          fi
+          echo "SUCCESS: All 4 release tarballs and 4 npm binaries present and valid"
+
+  release:
+    name: Create Release
+    needs: verify-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pilotty-*
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: Publish to npm
+    needs: verify-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Sync version from Cargo.toml to package.json
+        run: ./scripts/version-sync.sh
+
+      - name: Download npm binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm/bin
+
+      - name: Prepare npm package
+        run: |
+          cd npm/bin
+          # Flatten directory structure and rename binaries
+          # Each artifact is in npm-{os}-{arch}/pilotty
+          for dir in npm-*/; do
+            arch=$(basename "$dir" | sed 's/npm-//')
+            mv "$dir/pilotty" "pilotty-${arch}"
+            chmod +x "pilotty-${arch}"
+            rmdir "$dir"
+          done
+          ls -la
+          cd ..
+
+      - name: Publish to npm
+        run: |
+          cd npm
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

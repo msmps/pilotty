@@ -1,0 +1,10 @@
+[package]
+name = "pilotty-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types and logic for pilotty"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
