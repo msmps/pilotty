@@ -64,7 +64,8 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
             session: args.session.clone(),
         }),
         Commands::Click(args) => Some(Command::Click {
-            ref_id: args.ref_id.clone(),
+            row: args.row,
+            col: args.col,
             session: args.session.clone(),
         }),
         Commands::Scroll(args) => Some(Command::Scroll {

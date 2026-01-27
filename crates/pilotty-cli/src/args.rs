@@ -30,7 +30,7 @@ Examples:
     /// Kill a session and its child process
     Kill(KillArgs),
 
-    /// Get a snapshot of the terminal screen with interactive regions
+    /// Get a snapshot of the terminal screen
     #[command(after_help = "\
 Examples:
   pilotty snapshot                      # Snapshot default session (full JSON)
@@ -66,14 +66,14 @@ Examples:
   pilotty key -s editor Escape          # Send Escape to specific session")]
     Key(KeyArgs),
 
-    /// Click an interactive region by ref (e.g., @e1)
+    /// Click at a specific row and column coordinate
     #[command(after_help = "\
-Refs are stable identifiers for interactive elements found in snapshots.
-Use 'pilotty snapshot' to discover available refs.
+Click at a specific position in the terminal using 0-indexed coordinates.
+Use 'pilotty snapshot' to see cursor position and terminal dimensions.
 
 Examples:
-  pilotty click @e1                     # Click element with ref @e1
-  pilotty click -s editor @e3           # Click in a specific session")]
+  pilotty click 10 5                    # Click at row 10, column 5
+  pilotty click -s editor 5 20          # Click in a specific session")]
     Click(ClickArgs),
 
     /// Scroll the terminal up or down
@@ -167,9 +167,11 @@ pub struct KeyArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct ClickArgs {
-    /// Region ref to click (e.g., @e1)
-    #[arg(name = "REF")]
-    pub ref_id: String,
+    /// Row coordinate (0-indexed)
+    pub row: u16,
+
+    /// Column coordinate (0-indexed)
+    pub col: u16,
 
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,

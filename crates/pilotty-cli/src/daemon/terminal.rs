@@ -81,69 +81,6 @@ impl TerminalEmulator {
     pub fn resize(&mut self, size: TermSize) {
         self.parser.screen_mut().set_size(size.rows, size.cols);
     }
-
-    /// Get all cells for region detection.
-    ///
-    /// Returns a 2D grid of cells with characters and attributes,
-    /// suitable for use with `pilotty_core::region::Screen`.
-    pub fn get_cells(&self) -> Vec<Vec<pilotty_core::region::Cell>> {
-        use pilotty_core::region::{Cell, CellAttrs};
-
-        let (rows, cols) = self.parser.screen().size();
-        let mut result = Vec::with_capacity(rows as usize);
-
-        for row in 0..rows {
-            let mut row_cells = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let cell = self.parser.screen().cell(row, col);
-                let (ch, attrs) = match cell {
-                    Some(c) => {
-                        let contents = c.contents();
-                        let ch = contents.chars().next().unwrap_or(' ');
-                        let attrs = CellAttrs {
-                            fg: convert_color(c.fgcolor()),
-                            bg: convert_color(c.bgcolor()),
-                            bold: c.bold(),
-                            underline: c.underline(),
-                            inverse: c.inverse(),
-                        };
-                        (ch, attrs)
-                    }
-                    None => (' ', CellAttrs::default()),
-                };
-                row_cells.push(Cell::with_attrs(ch, attrs));
-            }
-            result.push(row_cells);
-        }
-
-        result
-    }
-}
-
-/// Convert vt100::Color to our Color enum.
-fn convert_color(color: vt100::Color) -> pilotty_core::region::Color {
-    use pilotty_core::region::Color;
-    match color {
-        vt100::Color::Default => Color::Default,
-        vt100::Color::Idx(0) => Color::Black,
-        vt100::Color::Idx(1) => Color::Red,
-        vt100::Color::Idx(2) => Color::Green,
-        vt100::Color::Idx(3) => Color::Yellow,
-        vt100::Color::Idx(4) => Color::Blue,
-        vt100::Color::Idx(5) => Color::Magenta,
-        vt100::Color::Idx(6) => Color::Cyan,
-        vt100::Color::Idx(7) => Color::White,
-        vt100::Color::Idx(8) => Color::BrightBlack,
-        vt100::Color::Idx(9) => Color::BrightRed,
-        vt100::Color::Idx(10) => Color::BrightGreen,
-        vt100::Color::Idx(11) => Color::BrightYellow,
-        vt100::Color::Idx(12) => Color::BrightBlue,
-        vt100::Color::Idx(13) => Color::BrightMagenta,
-        vt100::Color::Idx(14) => Color::BrightCyan,
-        vt100::Color::Idx(15) => Color::BrightWhite,
-        vt100::Color::Idx(n) => Color::Indexed(n),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
 }
 
 #[cfg(test)]
