@@ -222,10 +222,10 @@ impl AsyncPtyHandle {
                     e
                 );
             }
-            // Reap the zombie process to prevent accumulation.
+            // Collect exit status to prevent zombie process accumulation.
             // This is non-blocking since we just sent SIGKILL.
             if let Err(e) = child.try_wait() {
-                debug!("Failed to reap child process: {}", e);
+                debug!("Failed to collect child exit status: {}", e);
             }
         }
 
@@ -291,6 +291,22 @@ impl AsyncPtyHandle {
 
 impl Drop for AsyncPtyHandle {
     fn drop(&mut self) {
+        // Kill the child process first to prevent orphaned processes.
+        // This mirrors the logic in shutdown() but is synchronous since Drop can't be async.
+        if let Ok(mut child) = self.child.lock() {
+            if let Err(e) = child.kill() {
+                // Process may have already exited, that's fine
+                debug!(
+                    "Failed to kill child on drop (may have already exited): {}",
+                    e
+                );
+            }
+            // Collect exit status to prevent zombie accumulation
+            if let Err(e) = child.try_wait() {
+                debug!("Failed to collect child exit status on drop: {}", e);
+            }
+        }
+
         // Signal threads to shutdown
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);

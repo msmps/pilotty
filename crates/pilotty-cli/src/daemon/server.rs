@@ -11,6 +11,7 @@ use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::paths;
@@ -24,6 +25,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How often to check for idle shutdown condition.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for in-flight connections to complete during shutdown.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The daemon server that listens for client connections.
 pub struct DaemonServer {
@@ -62,9 +66,21 @@ impl DaemonServer {
             })?;
         }
 
+        // Helper to write PID file immediately after successful bind.
+        // This closes the race window where another process could see our socket
+        // but not find a valid PID file, incorrectly assuming we're dead.
+        let write_pid = |pid_path: &PathBuf| -> Result<()> {
+            std::fs::write(pid_path, std::process::id().to_string())
+                .with_context(|| format!("Failed to write PID file: {:?}", pid_path))
+        };
+
         // Try to bind directly (avoid TOCTOU race)
         let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
+            Ok(l) => {
+                // Write PID immediately after bind to prevent race condition
+                write_pid(&pid_path)?;
+                l
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Socket exists, check if daemon is still alive
                 if is_daemon_alive(&pid_path) {
@@ -104,18 +120,17 @@ impl DaemonServer {
                 std::fs::remove_file(&socket_path)
                     .with_context(|| format!("Failed to remove stale socket: {:?}", socket_path))?;
 
-                UnixListener::bind(&socket_path)
-                    .with_context(|| format!("Failed to bind to socket: {:?}", socket_path))?
+                let l = UnixListener::bind(&socket_path)
+                    .with_context(|| format!("Failed to bind to socket: {:?}", socket_path))?;
+                // Write PID immediately after bind to prevent race condition
+                write_pid(&pid_path)?;
+                l
             }
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("Failed to bind to socket: {:?}", socket_path));
             }
         };
-
-        // Write PID file
-        std::fs::write(&pid_path, std::process::id().to_string())
-            .with_context(|| format!("Failed to write PID file: {:?}", pid_path))?;
 
         info!("Daemon listening on {:?}", socket_path);
 
@@ -136,6 +151,7 @@ impl DaemonServer {
     /// - Session cleaner: removes sessions when their child process exits
     /// - Idle shutdown: signals shutdown after 5 minutes with no sessions
     ///
+    /// On shutdown, waits for in-flight connections to complete (with timeout).
     /// Returns when shutdown is signaled, allowing Drop to clean up socket/PID files.
     pub async fn run(&self) -> Result<()> {
         // Spawn session cleaner to remove dead sessions
@@ -143,6 +159,9 @@ impl DaemonServer {
 
         // Spawn idle shutdown monitor
         self.spawn_idle_shutdown_task();
+
+        // Track spawned connection handlers for graceful shutdown
+        let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
         loop {
             tokio::select! {
@@ -167,7 +186,7 @@ impl DaemonServer {
                             debug!("Accepted new connection");
                             let sessions = self.sessions.clone();
                             let shutdown = self.shutdown.clone();
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
                                 // Permit is held for the lifetime of the connection handler
                                 let _permit = permit;
                                 if let Err(e) = handle_connection(stream, sessions, shutdown).await {
@@ -180,10 +199,40 @@ impl DaemonServer {
                         }
                     }
                 }
+                // Reap completed connection tasks to prevent unbounded growth
+                Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    // Task completed, nothing to do (errors logged in handler)
+                }
                 _ = self.shutdown.notified() => {
-                    info!("Shutdown signal received, exiting run loop");
+                    info!("Shutdown signal received, waiting for in-flight connections");
                     break;
                 }
+            }
+        }
+
+        // Graceful shutdown: wait for in-flight connections with timeout
+        if !connection_tasks.is_empty() {
+            let pending = connection_tasks.len();
+            info!(
+                "Waiting for {} in-flight connection(s) to complete",
+                pending
+            );
+
+            let shutdown_deadline = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, async {
+                while connection_tasks.join_next().await.is_some() {
+                    // Keep draining until all tasks complete
+                }
+            })
+            .await;
+
+            if shutdown_deadline.is_err() {
+                let remaining = connection_tasks.len();
+                warn!(
+                    "Graceful shutdown timed out after {:?}, aborting {} connection(s)",
+                    GRACEFUL_SHUTDOWN_TIMEOUT, remaining
+                );
+                // JoinSet::abort_all() will cancel remaining tasks
+                connection_tasks.abort_all();
             }
         }
 
@@ -192,13 +241,15 @@ impl DaemonServer {
 
     /// Spawn a background task that monitors for idle shutdown.
     ///
-    /// The daemon will exit after IDLE_TIMEOUT (5 minutes) with no active sessions.
-    /// This ensures resources are freed when the daemon is not in use.
+    /// The daemon will exit after IDLE_TIMEOUT (5 minutes) with no active sessions
+    /// AND no active client connections. This prevents shutting down while a client
+    /// is connected but hasn't spawned a session yet.
     ///
     /// Signals shutdown via Notify instead of calling exit(), allowing Drop to run.
     fn spawn_idle_shutdown_task(&self) {
         let sessions = self.sessions.clone();
         let shutdown = self.shutdown.clone();
+        let semaphore = self.connection_semaphore.clone();
 
         tokio::spawn(async move {
             let mut idle_since: Option<Instant> = None;
@@ -206,44 +257,56 @@ impl DaemonServer {
             loop {
                 tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
 
-                if sessions.is_empty().await {
-                    // No sessions, start or continue idle timer
-                    let idle_start = *idle_since.get_or_insert_with(Instant::now);
+                // Check both sessions AND active connections.
+                // A client might be connected but not have spawned a session yet.
+                let has_sessions = !sessions.is_empty().await;
+                let has_connections = semaphore.available_permits() < MAX_CONNECTIONS;
 
-                    if idle_start.elapsed() >= IDLE_TIMEOUT {
-                        // Double-check to narrow race window where a session could be
-                        // created between the first is_empty() check and now
-                        if !sessions.is_empty().await {
-                            debug!("Session created during shutdown check, aborting shutdown");
-                            idle_since = None;
-                            continue;
-                        }
-
-                        info!(
-                            "No sessions for {} seconds, shutting down",
-                            IDLE_TIMEOUT.as_secs()
-                        );
-
-                        // Kill any remaining sessions (defensive, should be none)
-                        kill_all_sessions(&sessions).await;
-
-                        // Signal main loop to exit (allows Drop to clean up files)
-                        shutdown.notify_waiters();
-                        break;
-                    }
-
-                    debug!(
-                        "Idle for {} seconds (shutdown in {} seconds)",
-                        idle_start.elapsed().as_secs(),
-                        IDLE_TIMEOUT.saturating_sub(idle_start.elapsed()).as_secs()
-                    );
-                } else {
-                    // Sessions exist, reset idle timer
+                if has_sessions || has_connections {
+                    // Activity detected, reset idle timer
                     if idle_since.is_some() {
-                        debug!("Session activity detected, resetting idle timer");
+                        if has_sessions {
+                            debug!("Session activity detected, resetting idle timer");
+                        } else {
+                            debug!("Active connection detected, resetting idle timer");
+                        }
                     }
                     idle_since = None;
+                    continue;
                 }
+
+                // Truly idle: no sessions and no connections
+                let idle_start = *idle_since.get_or_insert_with(Instant::now);
+
+                if idle_start.elapsed() >= IDLE_TIMEOUT {
+                    // Double-check to narrow race window
+                    let still_has_sessions = !sessions.is_empty().await;
+                    let still_has_connections = semaphore.available_permits() < MAX_CONNECTIONS;
+
+                    if still_has_sessions || still_has_connections {
+                        debug!("Activity detected during shutdown check, aborting shutdown");
+                        idle_since = None;
+                        continue;
+                    }
+
+                    info!(
+                        "No activity for {} seconds, shutting down",
+                        IDLE_TIMEOUT.as_secs()
+                    );
+
+                    // Kill any remaining sessions (defensive, should be none)
+                    kill_all_sessions(&sessions).await;
+
+                    // Signal main loop to exit (allows Drop to clean up files)
+                    shutdown.notify_waiters();
+                    break;
+                }
+
+                debug!(
+                    "Idle for {} seconds (shutdown in {} seconds)",
+                    idle_start.elapsed().as_secs(),
+                    IDLE_TIMEOUT.saturating_sub(idle_start.elapsed()).as_secs()
+                );
             }
         });
     }
