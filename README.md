@@ -105,7 +105,7 @@ pilotty examples                  # Show end-to-end workflow example
 ### Screen Capture
 
 ```bash
-pilotty snapshot                  # Full JSON with regions and text
+pilotty snapshot                  # Full JSON with text
 pilotty snapshot --format compact # JSON without text field
 pilotty snapshot --format text    # Plain text with cursor indicator
 ```
@@ -260,10 +260,10 @@ pilotty spawn vim myfile.txt
 pilotty wait-for "myfile.txt"
 
 # 3. Take a snapshot to understand the screen
-pilotty snapshot --format full
+pilotty snapshot
 
-# 4. Parse the JSON, identify interactive elements
-# 5. Perform actions using refs
+# 4. Parse the text content and cursor position
+# 5. Navigate using keyboard commands
 pilotty key i                    # Enter insert mode
 pilotty type "Hello, World!"
 pilotty key Escape
