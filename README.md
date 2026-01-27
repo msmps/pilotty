@@ -12,7 +12,8 @@
 <p align="center">
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#commands">Commands</a>
+  <a href="#commands">Commands</a> •
+  <a href="#usage-with-ai-agents">AI Agents</a>
 </p>
 
 ---
