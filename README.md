@@ -150,11 +150,82 @@ The `snapshot` command returns structured data about the terminal screen:
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "text": "... plain text content ..."
+  "text": "Options: [x] Enable  [ ] Debug\nActions: [OK] [Cancel]",
+  "elements": [
+    { "kind": "toggle", "row": 0, "col": 9, "width": 3, "text": "[x]", "confidence": 1.0, "checked": true },
+    { "kind": "toggle", "row": 0, "col": 22, "width": 3, "text": "[ ]", "confidence": 1.0, "checked": false },
+    { "kind": "button", "row": 1, "col": 9, "width": 4, "text": "[OK]", "confidence": 0.8 },
+    { "kind": "button", "row": 1, "col": 14, "width": 8, "text": "[Cancel]", "confidence": 0.8 }
+  ],
+  "content_hash": 12345678901234567890
 }
 ```
 
-Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
+## UI Elements (Contextual)
+
+pilotty automatically detects interactive UI elements in terminal applications. Elements provide **read-only context** to help understand UI structure, with position data (row, col) for use with the click command.
+
+**Use keyboard navigation (`pilotty key Tab`, `pilotty key Enter`, `pilotty type "text"`) for reliable TUI interaction** rather than element-based actions, as UI element detection depends on visual patterns that may disappear after interaction.
+
+### Element Kinds
+
+| Kind | Detection Patterns | Confidence |
+|------|-------------------|------------|
+| **button** | Inverse video, `[OK]`, `<Cancel>` | 1.0 / 0.8 |
+| **input** | Cursor position, `____` underscores | 1.0 / 0.6 |
+| **toggle** | `[x]`, `[ ]`, `☑`, `☐` | 1.0 |
+
+### Element Fields
+
+| Field | Description |
+|-------|-------------|
+| `kind` | Element type: `button`, `input`, or `toggle` |
+| `row` | Row position (0-based) |
+| `col` | Column position (0-based) |
+| `width` | Width in terminal cells |
+| `text` | Text content of the element |
+| `confidence` | Detection confidence (0.0-1.0) |
+| `focused` | Whether element has focus (only present if true) |
+| `checked` | Toggle state (only present for toggles) |
+
+### Change Detection
+
+The `content_hash` field enables screen change detection between snapshots:
+
+```bash
+# Get initial snapshot
+SNAP1=$(pilotty snapshot)
+HASH1=$(echo "$SNAP1" | jq -r '.content_hash')
+
+# Perform some action
+pilotty key Tab
+
+# Check if screen changed
+SNAP2=$(pilotty snapshot)
+HASH2=$(echo "$SNAP2" | jq -r '.content_hash')
+
+if [ "$HASH1" != "$HASH2" ]; then
+  echo "Screen content changed"
+fi
+```
+
+### Workflow Example
+
+```bash
+# 1. Spawn a TUI with dialog elements
+pilotty spawn dialog --yesno "Continue?" 10 40
+
+# 2. Wait for dialog to render
+pilotty wait-for "Continue"
+
+# 3. Get snapshot with elements (for context)
+pilotty snapshot | jq '.elements'
+# Shows detected buttons, helps understand UI structure
+
+# 4. Navigate and interact with keyboard (reliable approach)
+pilotty key Tab      # Move to next element
+pilotty key Enter    # Activate selected element
+```
 
 ## Sessions
 

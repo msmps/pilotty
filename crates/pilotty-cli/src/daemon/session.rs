@@ -9,8 +9,11 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
+use pilotty_core::elements::classify::{detect, ClassifyContext};
+use pilotty_core::elements::Element;
 use pilotty_core::error::ApiError;
 use pilotty_core::protocol::SessionInfo;
+use pilotty_core::snapshot::compute_content_hash;
 
 use crate::daemon::pty::{AsyncPtyHandle, PtySession, TermSize};
 use crate::daemon::terminal::TerminalEmulator;
@@ -56,6 +59,11 @@ pub struct SnapshotData {
     pub cursor_pos: (u16, u16),
     pub cursor_visible: bool,
     pub size: TermSize,
+    /// Detected UI elements (computed on demand).
+    pub elements: Option<Vec<Element>>,
+    /// Hash of screen content for change detection.
+    /// Present when `with_elements=true`.
+    pub content_hash: Option<u64>,
 }
 
 /// An active PTY session.
@@ -86,21 +94,6 @@ impl Session {
             command: self.command.clone(),
             created_at: self.created_at.to_rfc3339(),
         }
-    }
-
-    /// Get the plain text content of the terminal screen.
-    pub async fn get_text(&self) -> String {
-        self.terminal.lock().await.get_text()
-    }
-
-    /// Get the cursor position (row, col) - 0-indexed.
-    pub async fn cursor_position(&self) -> (u16, u16) {
-        self.terminal.lock().await.cursor_position()
-    }
-
-    /// Check if the cursor is visible.
-    pub async fn cursor_visible(&self) -> bool {
-        self.terminal.lock().await.cursor_visible()
     }
 
     /// Check if terminal is in application cursor mode.
@@ -382,7 +375,14 @@ impl SessionManager {
     ///
     /// Uses a read lock on sessions since all operations use interior mutability,
     /// avoiding potential deadlocks from holding a write lock during I/O.
-    pub async fn get_snapshot_data(&self, id: &SessionId) -> Result<SnapshotData, ApiError> {
+    ///
+    /// If `with_elements` is true, element detection runs to identify
+    /// UI elements like buttons, checkboxes, and menu items.
+    pub async fn get_snapshot_data(
+        &self,
+        id: &SessionId,
+        with_elements: bool,
+    ) -> Result<SnapshotData, ApiError> {
         let sessions = self.sessions.read().await;
         let session = sessions
             .get(id)
@@ -391,17 +391,33 @@ impl SessionManager {
         // Drain pending PTY output to update terminal state
         session.drain_pty_output().await;
 
+        // Lock terminal once for all reads
+        let terminal = session.terminal.lock().await;
+
         // Get snapshot data
-        let text = session.get_text().await;
-        let cursor_pos = session.cursor_position().await;
-        let cursor_visible = session.cursor_visible().await;
+        let text = terminal.get_text();
+        let cursor_pos = terminal.cursor_position();
+        let cursor_visible = terminal.cursor_visible();
         let size = session.size;
+
+        // Detect UI elements and compute content hash if requested
+        let (elements, content_hash) = if with_elements {
+            let (cursor_row, cursor_col) = cursor_pos;
+            let ctx = ClassifyContext::new().with_cursor(cursor_row, cursor_col);
+            let elems = detect(&*terminal, &ctx);
+            let hash = compute_content_hash(&text);
+            (Some(elems), Some(hash))
+        } else {
+            (None, None)
+        };
 
         Ok(SnapshotData {
             text,
             cursor_pos,
             cursor_visible,
             size,
+            elements,
+            content_hash,
         })
     }
 

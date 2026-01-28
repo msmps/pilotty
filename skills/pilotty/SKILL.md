@@ -30,7 +30,7 @@ This is the #1 cause of agent failures. When in doubt: **flags first, then comma
 ```bash
 pilotty spawn vim file.txt        # Start TUI app in managed session
 pilotty wait-for "file.txt"       # Wait for app to be ready
-pilotty snapshot                  # Get screen state with cursor position
+pilotty snapshot                  # Get screen state with UI elements
 pilotty key i                     # Enter insert mode
 pilotty type "Hello, World!"      # Type text
 pilotty key Escape                # Exit insert mode
@@ -41,9 +41,10 @@ pilotty kill                      # End session
 
 1. **Spawn**: `pilotty spawn <command>` starts the app in a background PTY
 2. **Wait**: `pilotty wait-for <text>` ensures the app is ready
-3. **Snapshot**: `pilotty snapshot` returns screen state with text content and cursor position
-4. **Interact**: Use keyboard commands (`key`, `type`) or click at coordinates (`click <row> <col>`)
-5. **Re-snapshot**: After screen changes, snapshot again to see updated state
+3. **Snapshot**: `pilotty snapshot` returns screen state with detected UI elements
+4. **Understand**: Parse `elements[]` to identify buttons, inputs, toggles
+5. **Interact**: Use keyboard commands (`key`, `type`) to navigate and interact
+6. **Re-snapshot**: Check `content_hash` to detect screen changes
 
 ## Commands
 
@@ -56,14 +57,14 @@ pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
 pilotty daemon                    # Manually start daemon (usually auto-starts)
-pilotty stop                      # Stop daemon and all sessions
+pilotty shutdown                  # Stop daemon and all sessions
 pilotty examples                  # Show end-to-end workflow example
 ```
 
 ### Screen capture
 
 ```bash
-pilotty snapshot                  # Full JSON with text content
+pilotty snapshot                  # Full JSON with text content and elements
 pilotty snapshot --format compact # JSON without text field
 pilotty snapshot --format text    # Plain text with cursor indicator
 pilotty snapshot -s myapp         # Snapshot specific session
@@ -125,16 +126,23 @@ PILOTTY_SOCKET_DIR="/tmp/pilotty" # Override socket directory
 RUST_LOG="debug"                  # Enable debug logging
 ```
 
-## Snapshot output
+## Snapshot Output
 
-The `snapshot` command returns structured JSON:
+The `snapshot` command returns structured JSON with detected UI elements:
 
 ```json
 {
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "text": "... plain text content ..."
+  "text": "Settings:\n  [x] Notifications  [ ] Dark mode\n  [Save]  [Cancel]",
+  "elements": [
+    { "kind": "toggle", "row": 1, "col": 2, "width": 3, "text": "[x]", "confidence": 1.0, "checked": true },
+    { "kind": "toggle", "row": 1, "col": 20, "width": 3, "text": "[ ]", "confidence": 1.0, "checked": false },
+    { "kind": "button", "row": 2, "col": 2, "width": 6, "text": "[Save]", "confidence": 0.8 },
+    { "kind": "button", "row": 2, "col": 10, "width": 8, "text": "[Cancel]", "confidence": 0.8 }
+  ],
+  "content_hash": 12345678901234567890
 }
 ```
 
@@ -147,7 +155,85 @@ bash-3.2$ [_]
 
 The `[_]` shows cursor position. Use the text content to understand screen state and navigate with keyboard commands.
 
-## Navigation approach
+---
+
+## Element Detection
+
+pilotty automatically detects interactive UI elements in terminal applications. Elements provide **read-only context** to help understand UI structure.
+
+### Element Kinds
+
+| Kind | Detection Patterns | Confidence | Fields |
+|------|-------------------|------------|--------|
+| **toggle** | `[x]`, `[ ]`, `[*]`, `☑`, `☐` | 1.0 | `checked: bool` |
+| **button** | Inverse video, `[OK]`, `<Cancel>`, `(Submit)` | 1.0 / 0.8 | `focused: bool` (if true) |
+| **input** | Cursor position, `____` underscores | 1.0 / 0.6 | `focused: bool` (if true) |
+
+### Element Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kind` | string | Element type: `button`, `input`, or `toggle` |
+| `row` | number | Row position (0-based from top) |
+| `col` | number | Column position (0-based from left) |
+| `width` | number | Width in terminal cells (CJK chars = 2) |
+| `text` | string | Text content of the element |
+| `confidence` | number | Detection confidence (0.0-1.0) |
+| `focused` | bool | Whether element has focus (only present if true) |
+| `checked` | bool | Toggle state (only present for toggles) |
+
+### Confidence Levels
+
+| Confidence | Meaning |
+|------------|---------|
+| **1.0** | High confidence: Cursor position, inverse video, checkbox patterns |
+| **0.8** | Medium confidence: Bracket patterns `[OK]`, `<Cancel>` |
+| **0.6** | Lower confidence: Underscore input fields `____` |
+
+### Change Detection
+
+The `content_hash` field enables efficient screen change detection:
+
+```bash
+# Get initial state
+SNAP1=$(pilotty snapshot)
+HASH1=$(echo "$SNAP1" | jq -r '.content_hash')
+
+# Perform action
+pilotty key Tab
+
+# Check if screen changed
+SNAP2=$(pilotty snapshot)
+HASH2=$(echo "$SNAP2" | jq -r '.content_hash')
+
+if [ "$HASH1" != "$HASH2" ]; then
+  echo "Screen changed - re-analyze elements"
+fi
+```
+
+### Using Elements Effectively
+
+Elements are **read-only context** for understanding the UI. Use **keyboard navigation** for reliable interaction:
+
+```bash
+# 1. Get snapshot to understand UI structure
+pilotty snapshot | jq '.elements'
+# Output shows toggles (checked/unchecked) and buttons with positions
+
+# 2. Navigate and interact with keyboard (reliable approach)
+pilotty key Tab          # Move to next element
+pilotty key Space        # Toggle checkbox
+pilotty key Enter        # Activate button
+
+# 3. Verify state changed
+pilotty snapshot | jq '.elements[] | select(.kind == "toggle")'
+```
+
+**Key insight**: Use elements to understand WHAT is on screen, use keyboard to interact with it.
+
+---
+
+## Navigation Approach
 
 pilotty uses keyboard-first navigation, just like a human would:
 
@@ -160,6 +246,7 @@ pilotty key Tab           # Move to next element
 pilotty key Enter         # Activate/select
 pilotty key Escape        # Cancel/back
 pilotty key Up            # Move up in list/menu
+pilotty key Space         # Toggle checkbox
 
 # 3. Type text when needed
 pilotty type "search term"
@@ -169,7 +256,9 @@ pilotty key Enter
 pilotty click 5 10        # Click at row 5, col 10
 ```
 
-**Key insight**: Parse the snapshot text to understand what's on screen, then use keyboard commands to navigate. This works reliably across all TUI applications.
+**Key insight**: Parse the snapshot text and elements to understand what's on screen, then use keyboard commands to navigate. This works reliably across all TUI applications.
+
+---
 
 ## Example: Edit file with vim
 
@@ -197,22 +286,64 @@ pilotty key -s editor Enter
 pilotty list-sessions
 ```
 
-## Example: Dialog interaction
+## Example: Dialog checklist interaction
 
 ```bash
-# 1. Spawn dialog (--name before command)
-pilotty spawn --name dialog dialog --yesno "Continue?" 10 40
+# 1. Spawn dialog checklist (--name before command)
+pilotty spawn --name opts dialog --checklist "Select features:" 12 50 4 \
+    "notifications" "Push notifications" on \
+    "darkmode" "Dark mode theme" off \
+    "autosave" "Auto-save documents" on \
+    "telemetry" "Usage analytics" off
 
-# 2. Get snapshot to see the dialog
-pilotty snapshot -s dialog --format text
-# Shows: < Yes > and < No > buttons
+# 2. Wait for dialog to render
+sleep 0.5
 
-# 3. Navigate with keyboard
-pilotty key -s dialog Tab      # Move to next button
-pilotty key -s dialog Enter    # Activate selected button
+# 3. Get snapshot and examine elements
+pilotty snapshot -s opts | jq '.elements[] | select(.kind == "toggle")'
+# Shows toggle elements with checked state and positions
 
-# Or click at coordinates if you know the button position
-pilotty click -s dialog 8 15   # Click at row 8, col 15
+# 4. Navigate to "darkmode" and toggle it
+pilotty key -s opts Down      # Move to second option
+pilotty key -s opts Space     # Toggle it on
+
+# 5. Verify the change
+pilotty snapshot -s opts | jq '.elements[] | select(.kind == "toggle") | {text, checked}'
+
+# 6. Confirm selection
+pilotty key -s opts Enter
+
+# 7. Clean up
+pilotty kill -s opts
+```
+
+## Example: Form filling with elements
+
+```bash
+# 1. Spawn a form application
+pilotty spawn --name form my-form-app
+
+# 2. Get snapshot to understand form structure
+pilotty snapshot -s form | jq '.elements'
+# Shows inputs, toggles, and buttons with positions for click command
+
+# 3. Tab to first input (likely already focused)
+pilotty type -s form "myusername"
+
+# 4. Tab to password field
+pilotty key -s form Tab
+pilotty type -s form "mypassword"
+
+# 5. Tab to remember me and toggle
+pilotty key -s form Tab
+pilotty key -s form Space
+
+# 6. Tab to Login and activate
+pilotty key -s form Tab
+pilotty key -s form Enter
+
+# 7. Check result
+pilotty snapshot -s form --format text
 ```
 
 ## Example: Monitor with htop
@@ -234,6 +365,8 @@ pilotty key -s monitor q     # Quit
 # 5. Kill session
 pilotty kill -s monitor
 ```
+
+---
 
 ## Sessions
 
@@ -262,7 +395,7 @@ The first session spawned without `--name` is automatically named `default`.
 
 > **Important:** The `--name` flag must come **before** the command. Everything after the command is passed as arguments to that command.
 
-## Daemon architecture
+## Daemon Architecture
 
 pilotty uses a background daemon for session management:
 
@@ -273,7 +406,7 @@ pilotty uses a background daemon for session management:
 
 You rarely need to manage the daemon manually.
 
-## Error handling
+## Error Handling
 
 Errors include actionable suggestions:
 
@@ -293,7 +426,9 @@ Errors include actionable suggestions:
 }
 ```
 
-## Common patterns
+---
+
+## Common Patterns
 
 ### Wait then act
 
@@ -310,6 +445,16 @@ pilotty snapshot --format text | grep "Error"  # Check for errors
 pilotty key Enter                               # Then proceed
 ```
 
+### Check for specific element
+
+```bash
+# Check if the first toggle is checked
+pilotty snapshot | jq '.elements[] | select(.kind == "toggle") | {text, checked}' | head -1
+
+# Find element at specific position
+pilotty snapshot | jq '.elements[] | select(.row == 5 and .col == 10)'
+```
+
 ### Retry on timeout
 
 ```bash
@@ -319,7 +464,9 @@ pilotty wait-for "Ready" -t 5000 || {
 }
 ```
 
-## Deep-dive documentation
+---
+
+## Deep-dive Documentation
 
 For detailed patterns and edge cases, see:
 
@@ -327,8 +474,9 @@ For detailed patterns and edge cases, see:
 |-----------|-------------|
 | [references/session-management.md](references/session-management.md) | Multi-session patterns, isolation, cleanup |
 | [references/key-input.md](references/key-input.md) | Complete key combinations reference |
+| [references/element-detection.md](references/element-detection.md) | Detection rules, confidence, patterns |
 
-## Ready-to-use templates
+## Ready-to-use Templates
 
 Executable workflow scripts:
 
@@ -337,10 +485,12 @@ Executable workflow scripts:
 | [templates/vim-workflow.sh](templates/vim-workflow.sh) | Edit file with vim, save, exit |
 | [templates/dialog-interaction.sh](templates/dialog-interaction.sh) | Handle dialog/whiptail prompts |
 | [templates/multi-session.sh](templates/multi-session.sh) | Parallel TUI orchestration |
+| [templates/element-detection.sh](templates/element-detection.sh) | Element detection demo |
 
 Usage:
 ```bash
 ./templates/vim-workflow.sh /tmp/myfile.txt "File content here"
 ./templates/dialog-interaction.sh
 ./templates/multi-session.sh
+./templates/element-detection.sh
 ```

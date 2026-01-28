@@ -615,14 +615,17 @@ async fn handle_snapshot(
         Err(e) => return Response::error(request_id, e),
     };
 
+    let format = format.unwrap_or(SnapshotFormat::Full);
+
+    // Full format includes UI element detection
+    let with_elements = matches!(format, SnapshotFormat::Full);
+
     // Get snapshot data (drains PTY output first)
-    let snapshot = match sessions.get_snapshot_data(&session_id).await {
+    let snapshot = match sessions.get_snapshot_data(&session_id, with_elements).await {
         Ok(data) => data,
         Err(e) => return Response::error(request_id, e),
     };
     let (cursor_row, cursor_col) = snapshot.cursor_pos;
-
-    let format = format.unwrap_or(SnapshotFormat::Full);
 
     match format {
         SnapshotFormat::Text => {
@@ -637,8 +640,29 @@ async fn handle_snapshot(
                 },
             )
         }
-        SnapshotFormat::Full | SnapshotFormat::Compact => {
-            // Build ScreenState JSON
+        SnapshotFormat::Full => {
+            // Full: text + elements + metadata + content_hash
+            let snapshot_id = sessions.next_snapshot_id();
+
+            let screen_state = ScreenState {
+                snapshot_id,
+                size: TerminalSize {
+                    cols: snapshot.size.cols,
+                    rows: snapshot.size.rows,
+                },
+                cursor: CursorState {
+                    row: cursor_row,
+                    col: cursor_col,
+                    visible: snapshot.cursor_visible,
+                },
+                text: Some(snapshot.text),
+                elements: snapshot.elements,
+                content_hash: snapshot.content_hash,
+            };
+            Response::success(request_id, ResponseData::ScreenState(screen_state))
+        }
+        SnapshotFormat::Compact => {
+            // Compact: metadata only, no text, elements, or hash
             let snapshot_id = sessions.next_snapshot_id();
             let screen_state = ScreenState {
                 snapshot_id,
@@ -651,11 +675,9 @@ async fn handle_snapshot(
                     col: cursor_col,
                     visible: snapshot.cursor_visible,
                 },
-                text: if format == SnapshotFormat::Full {
-                    Some(snapshot.text)
-                } else {
-                    None
-                },
+                text: None,
+                elements: None,
+                content_hash: None,
             };
             Response::success(request_id, ResponseData::ScreenState(screen_state))
         }
@@ -1016,16 +1038,20 @@ async fn handle_wait_for(
         Err(e) => return Response::error(request_id, e),
     };
 
-    // Compile regex if needed
+    // Compile regex if needed.
+    // Limit compiled pattern size to prevent slow compilation.
     let compiled_regex = if use_regex {
-        match regex::Regex::new(&pattern) {
+        match regex::RegexBuilder::new(&pattern)
+            .size_limit(256 * 1024) // 256KB compiled size limit
+            .build()
+        {
             Ok(r) => Some(r),
             Err(e) => {
                 return Response::error(
                     request_id,
                     ApiError::invalid_input_with_suggestion(
                         format!("Invalid regex pattern: {}", e),
-                        "Check your regex syntax. Common issues: unescaped special chars, unbalanced parentheses.",
+                        "Check your regex syntax. Common issues: unescaped special chars, unbalanced parentheses, or pattern too complex.",
                     ),
                 );
             }
@@ -1054,8 +1080,8 @@ async fn handle_wait_for(
             );
         }
 
-        // Get current screen text
-        let snapshot = match sessions.get_snapshot_data(&session_id).await {
+        // Get current screen text (no elements needed for wait_for)
+        let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
             Ok(data) => data,
             Err(e) => return Response::error(request_id, e),
         };
@@ -2346,5 +2372,174 @@ mod tests {
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_with_elements() {
+        use pilotty_core::elements::ElementKind;
+
+        let temp_dir = std::env::temp_dir();
+        let socket_path = temp_dir.join(format!("pilotty-elem-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(5), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Spawn a session with output containing detectable elements:
+        // - [OK] and [Cancel] → Buttons (bracket pattern, confidence 0.8)
+        // - [x] and [ ] → Toggles (checkbox pattern, confidence 1.0)
+        let spawn_request = Request {
+            id: "spawn-elem".to_string(),
+            command: Command::Spawn {
+                command: vec![
+                    "printf".to_string(),
+                    "Options: [x] Enable  [ ] Debug\nActions: [OK] [Cancel]\n".to_string(),
+                ],
+                session_name: Some("elem-test".to_string()),
+                cwd: None,
+            },
+        };
+        let request_json = serde_json::to_string(&spawn_request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        // Give printf time to complete
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Request snapshot with Full format (includes elements)
+        let snap_request = Request {
+            id: "snap-elem".to_string(),
+            command: Command::Snapshot {
+                session: Some("elem-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+            },
+        };
+        let snap_json = serde_json::to_string(&snap_request).unwrap();
+        writer.write_all(snap_json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        let snap_response: Response =
+            serde_json::from_str(&response_line).expect("parse snap response");
+        assert!(snap_response.success, "Snapshot should succeed");
+
+        // Verify ScreenState with elements
+        if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
+            // Full format includes text
+            assert!(
+                screen_state.text.is_some(),
+                "Full format should include text"
+            );
+
+            // Full format SHOULD include elements
+            assert!(
+                screen_state.elements.is_some(),
+                "Full format should include elements"
+            );
+
+            // Full format SHOULD include content_hash
+            assert!(
+                screen_state.content_hash.is_some(),
+                "Full format should include content_hash"
+            );
+
+            let elements = screen_state.elements.unwrap();
+
+            // Should detect at least the toggles (checkboxes are high confidence)
+            // [x] -> Toggle checked=true, [ ] -> Toggle checked=false
+            let toggles: Vec<_> = elements
+                .iter()
+                .filter(|e| e.kind == ElementKind::Toggle)
+                .collect();
+            assert!(
+                toggles.len() >= 2,
+                "Should detect at least 2 toggles, found {}",
+                toggles.len()
+            );
+
+            // Verify toggle states
+            let checked_toggle = toggles.iter().find(|t| t.checked == Some(true));
+            let unchecked_toggle = toggles.iter().find(|t| t.checked == Some(false));
+            assert!(
+                checked_toggle.is_some(),
+                "Should have a checked toggle ([x])"
+            );
+            assert!(
+                unchecked_toggle.is_some(),
+                "Should have an unchecked toggle ([ ])"
+            );
+
+            // Check toggle confidence is 1.0 (checkbox pattern)
+            for toggle in &toggles {
+                assert!(
+                    (toggle.confidence - 1.0).abs() < f32::EPSILON,
+                    "Toggle confidence should be 1.0, got {}",
+                    toggle.confidence
+                );
+            }
+
+            // May also detect [OK] and [Cancel] as buttons
+            let buttons: Vec<_> = elements
+                .iter()
+                .filter(|e| e.kind == ElementKind::Button)
+                .collect();
+            // Buttons have 0.8 confidence (bracket pattern)
+            for button in &buttons {
+                assert!(
+                    (button.confidence - 0.8).abs() < f32::EPSILON,
+                    "Button confidence should be 0.8, got {}",
+                    button.confidence
+                );
+            }
+
+            // Verify JSON serialization is clean (check raw response)
+            // - Non-focused elements should NOT have "focused" in their JSON
+            // - Buttons should NOT have "checked" in their JSON
+            let raw_json = &response_line;
+            // Count occurrences of "focused" - should only appear for focused elements
+            let focused_count = raw_json.matches("\"focused\"").count();
+            let elements_with_focus = elements.iter().filter(|e| e.focused).count();
+            assert_eq!(
+                focused_count, elements_with_focus,
+                "JSON should only include 'focused' for focused elements"
+            );
+        } else {
+            panic!(
+                "Expected ScreenState response data, got: {:?}",
+                snap_response.data
+            );
+        }
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

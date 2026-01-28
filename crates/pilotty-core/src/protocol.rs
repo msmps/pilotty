@@ -79,12 +79,12 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotFormat {
-    /// Full JSON with all metadata.
+    /// Full JSON with all metadata including text and elements.
     #[default]
     Full,
-    /// Compact format with inline refs.
+    /// Compact format: omits text and elements, just metadata.
     Compact,
-    /// Plain text only.
+    /// Plain text only (no JSON structure).
     Text,
 }
 
@@ -97,7 +97,7 @@ pub enum ScrollDirection {
 }
 
 /// A response from daemon to CLI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub id: String,
     pub success: bool,
@@ -128,7 +128,7 @@ impl Response {
 }
 
 /// Response payload variants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseData {
     /// Full screen state snapshot.

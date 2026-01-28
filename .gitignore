@@ -18,6 +18,7 @@ target/
 # Agent/AI tooling
 .opencode/
 .claude/
+.agents/
 
 # Internal docs (not for public repo)
 docs/
