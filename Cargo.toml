@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "MIT"
-authors = ["pilotty contributors"]
+authors = ["Matt Simpson"]
 
 [workspace.dependencies]
 # Async runtime
