@@ -4,6 +4,8 @@
 //! that can parse ANSI escape sequences from PTY output.
 
 use crate::daemon::pty::TermSize;
+use pilotty_core::elements::grid::{ScreenCell, ScreenGrid};
+use pilotty_core::elements::style::{CellStyle, Color};
 
 /// Terminal emulator that parses ANSI escape sequences.
 ///
@@ -88,6 +90,49 @@ impl TerminalEmulator {
     /// Resize the terminal.
     pub fn resize(&mut self, size: TermSize) {
         self.parser.screen_mut().set_size(size.rows, size.cols);
+    }
+}
+
+/// Convert vt100 color to core Color type.
+fn convert_color(vt_color: vt100::Color) -> Color {
+    match vt_color {
+        vt100::Color::Default => Color::Default,
+        vt100::Color::Idx(idx) => Color::Indexed { index: idx },
+        vt100::Color::Rgb(r, g, b) => Color::Rgb { r, g, b },
+    }
+}
+
+/// Convert vt100 cell to core ScreenCell.
+fn convert_cell(vt_cell: &vt100::Cell) -> ScreenCell {
+    // Get the character from the cell contents
+    // vt100::Cell::contents() returns a String (may be empty for wide char continuations)
+    let contents = vt_cell.contents();
+    let ch = contents.chars().next().unwrap_or(' ');
+
+    let style = CellStyle {
+        bold: vt_cell.bold(),
+        underline: vt_cell.underline(),
+        inverse: vt_cell.inverse(),
+        fg_color: convert_color(vt_cell.fgcolor()),
+        bg_color: convert_color(vt_cell.bgcolor()),
+    };
+
+    ScreenCell::new(ch, style)
+}
+
+impl ScreenGrid for TerminalEmulator {
+    fn rows(&self) -> u16 {
+        let (rows, _cols) = self.parser.screen().size();
+        rows
+    }
+
+    fn cols(&self) -> u16 {
+        let (_rows, cols) = self.parser.screen().size();
+        cols
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Option<ScreenCell> {
+        self.parser.screen().cell(row, col).map(convert_cell)
     }
 }
 
@@ -489,5 +534,131 @@ mod tests {
             !term.application_cursor(),
             "Should be normal mode after ESC[?1l"
         );
+    }
+
+    // ScreenGrid implementation tests
+
+    #[test]
+    fn test_screen_grid_dimensions() {
+        let term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+
+        assert_eq!(ScreenGrid::rows(&term), 24);
+        assert_eq!(ScreenGrid::cols(&term), 80);
+    }
+
+    #[test]
+    fn test_screen_grid_cell_access() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        term.feed(b"Hello");
+
+        // Check cells with content via ScreenGrid trait
+        let cell_h = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert_eq!(cell_h.ch, 'H');
+
+        let cell_o = ScreenGrid::cell(&term, 0, 4).expect("Cell should exist");
+        assert_eq!(cell_o.ch, 'o');
+
+        // Check empty cell
+        let cell_empty = ScreenGrid::cell(&term, 0, 10).expect("Cell should exist");
+        assert_eq!(cell_empty.ch, ' ');
+    }
+
+    #[test]
+    fn test_screen_grid_out_of_bounds() {
+        let term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+
+        assert!(ScreenGrid::cell(&term, 0, 0).is_some());
+        assert!(ScreenGrid::cell(&term, 23, 79).is_some());
+        assert!(ScreenGrid::cell(&term, 24, 0).is_none()); // row out of bounds
+        assert!(ScreenGrid::cell(&term, 0, 80).is_none()); // col out of bounds
+    }
+
+    #[test]
+    fn test_screen_grid_color_mapping_default() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        term.feed(b"A");
+
+        let cell = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert_eq!(cell.style.fg_color, Color::Default);
+        assert_eq!(cell.style.bg_color, Color::Default);
+    }
+
+    #[test]
+    fn test_screen_grid_color_mapping_indexed() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        // Red foreground (color 1), blue background (color 4)
+        term.feed(b"\x1b[31;44mX");
+
+        let cell = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert_eq!(cell.style.fg_color, Color::Indexed { index: 1 });
+        assert_eq!(cell.style.bg_color, Color::Indexed { index: 4 });
+    }
+
+    #[test]
+    fn test_screen_grid_color_mapping_rgb() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        // 24-bit RGB: ESC[38;2;255;128;64m for fg, ESC[48;2;0;0;0m for bg
+        term.feed(b"\x1b[38;2;255;128;64mR");
+
+        let cell = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert_eq!(
+            cell.style.fg_color,
+            Color::Rgb {
+                r: 255,
+                g: 128,
+                b: 64
+            }
+        );
+    }
+
+    #[test]
+    fn test_screen_grid_style_bold() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        term.feed(b"N\x1b[1mB\x1b[0m");
+
+        let normal = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert!(!normal.style.bold);
+
+        let bold = ScreenGrid::cell(&term, 0, 1).expect("Cell should exist");
+        assert!(bold.style.bold);
+    }
+
+    #[test]
+    fn test_screen_grid_style_underline() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        term.feed(b"N\x1b[4mU\x1b[0m");
+
+        let normal = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert!(!normal.style.underline);
+
+        let underlined = ScreenGrid::cell(&term, 0, 1).expect("Cell should exist");
+        assert!(underlined.style.underline);
+    }
+
+    #[test]
+    fn test_screen_grid_style_inverse() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        // \x1b[7m = inverse on
+        term.feed(b"N\x1b[7mI\x1b[0m");
+
+        let normal = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert!(!normal.style.inverse);
+
+        let inverse = ScreenGrid::cell(&term, 0, 1).expect("Cell should exist");
+        assert!(inverse.style.inverse);
+    }
+
+    #[test]
+    fn test_screen_grid_combined_styles() {
+        let mut term = TerminalEmulator::new(TermSize { cols: 80, rows: 24 });
+        // Bold + underline + inverse + red fg + blue bg
+        term.feed(b"\x1b[1;4;7;31;44mS");
+
+        let cell = ScreenGrid::cell(&term, 0, 0).expect("Cell should exist");
+        assert!(cell.style.bold);
+        assert!(cell.style.underline);
+        assert!(cell.style.inverse);
+        assert_eq!(cell.style.fg_color, Color::Indexed { index: 1 });
+        assert_eq!(cell.style.bg_color, Color::Indexed { index: 4 });
     }
 }

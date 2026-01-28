@@ -1,12 +1,16 @@
 <p align="center">
-  <img src="assets/pilotty.png" alt="pilotty logo" width="400">
+  <img src="assets/pilotty.png" alt="pilotty - Terminal automation CLI enabling AI agents to control TUI applications" width="400">
 </p>
 
 <h1 align="center">pilotty</h1>
 
 <p align="center">
+  <sub>The terminal equivalent of <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a></sub>
+</p>
+
+<p align="center">
   <strong>Terminal automation CLI for AI agents</strong><br>
-  <em>Like <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a>, but for TUI applications.</em>
+  <em>Control vim, htop, lazygit, dialog, and any TUI programmatically</em>
 </p>
 
 <p align="center">
@@ -21,15 +25,22 @@
 > [!NOTE]
 > **Built with AI, for AI.** This project was built with the support of an AI agent, planned thoroughly with a tight feedback loop and reviewed at each step. While we've tested extensively, edge cases may exist. Use in production at your own discretion, and please [report any issues](https://github.com/msmps/pilotty/issues) you find!
 
-pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, captures terminal output, and provides keyboard/mouse input capabilities for navigating TUI applications.
+pilotty enables AI agents to interact with terminal applications through a simple command-line interface. It manages pseudo-terminal (PTY) sessions with full VT100 terminal emulation, captures screen state, and provides keyboard/mouse input for navigating terminal user interfaces. Think of it as headless terminal automation for AI workflows.
 
 ## Features
 
-- **PTY Management**: Spawn and manage terminal applications in background sessions
+- **PTY (Pseudo-Terminal) Management**: Spawn and manage terminal applications in background sessions
+- **Terminal Emulation**: Full VT100 emulation for accurate screen capture and state tracking
 - **Keyboard Navigation**: Interact with TUIs using Tab, Enter, arrow keys, and key combos
 - **AI-Friendly Output**: Clean JSON responses with actionable suggestions on errors
 - **Multi-Session**: Run multiple terminal apps simultaneously in isolated sessions
 - **Zero Config**: Daemon auto-starts on first command, auto-stops after 5 minutes idle
+
+## Why pilotty?
+
+[agent-browser](https://github.com/vercel-labs/agent-browser) by Vercel Labs lets AI agents control web browsers. pilotty does the same for terminals.
+
+**Origin story:** Built to solve a personal problem, pilotty was created to enable AI agents to interact with [OpenTUI](https://github.com/anomalyco/opentui) interfaces and control [OpenCode](https://github.com/anomalyco/opencode) programmatically. If you're building TUIs or working with terminal applications, pilotty lets AI navigate them just like a human would.
 
 ## Installation
 
@@ -150,11 +161,82 @@ The `snapshot` command returns structured data about the terminal screen:
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
-  "text": "... plain text content ..."
+  "text": "Options: [x] Enable  [ ] Debug\nActions: [OK] [Cancel]",
+  "elements": [
+    { "kind": "toggle", "row": 0, "col": 9, "width": 3, "text": "[x]", "confidence": 1.0, "checked": true },
+    { "kind": "toggle", "row": 0, "col": 22, "width": 3, "text": "[ ]", "confidence": 1.0, "checked": false },
+    { "kind": "button", "row": 1, "col": 9, "width": 4, "text": "[OK]", "confidence": 0.8 },
+    { "kind": "button", "row": 1, "col": 14, "width": 8, "text": "[Cancel]", "confidence": 0.8 }
+  ],
+  "content_hash": 12345678901234567890
 }
 ```
 
-Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
+## UI Elements (Contextual)
+
+pilotty automatically detects interactive UI elements in terminal applications. Elements provide **read-only context** to help understand UI structure, with position data (row, col) for use with the click command.
+
+**Use keyboard navigation (`pilotty key Tab`, `pilotty key Enter`, `pilotty type "text"`) for reliable TUI interaction** rather than element-based actions, as UI element detection depends on visual patterns that may disappear after interaction.
+
+### Element Kinds
+
+| Kind | Detection Patterns | Confidence |
+|------|-------------------|------------|
+| **button** | Inverse video, `[OK]`, `<Cancel>` | 1.0 / 0.8 |
+| **input** | Cursor position, `____` underscores | 1.0 / 0.6 |
+| **toggle** | `[x]`, `[ ]`, `☑`, `☐` | 1.0 |
+
+### Element Fields
+
+| Field | Description |
+|-------|-------------|
+| `kind` | Element type: `button`, `input`, or `toggle` |
+| `row` | Row position (0-based) |
+| `col` | Column position (0-based) |
+| `width` | Width in terminal cells |
+| `text` | Text content of the element |
+| `confidence` | Detection confidence (0.0-1.0) |
+| `focused` | Whether element has focus (only present if true) |
+| `checked` | Toggle state (only present for toggles) |
+
+### Change Detection
+
+The `content_hash` field enables screen change detection between snapshots:
+
+```bash
+# Get initial snapshot
+SNAP1=$(pilotty snapshot)
+HASH1=$(echo "$SNAP1" | jq -r '.content_hash')
+
+# Perform some action
+pilotty key Tab
+
+# Check if screen changed
+SNAP2=$(pilotty snapshot)
+HASH2=$(echo "$SNAP2" | jq -r '.content_hash')
+
+if [ "$HASH1" != "$HASH2" ]; then
+  echo "Screen content changed"
+fi
+```
+
+### Workflow Example
+
+```bash
+# 1. Spawn a TUI with dialog elements
+pilotty spawn dialog --yesno "Continue?" 10 40
+
+# 2. Wait for dialog to render
+pilotty wait-for "Continue"
+
+# 3. Get snapshot with elements (for context)
+pilotty snapshot | jq '.elements'
+# Shows detected buttons, helps understand UI structure
+
+# 4. Navigate and interact with keyboard (reliable approach)
+pilotty key Tab      # Move to next element
+pilotty key Enter    # Activate selected element
+```
 
 ## Sessions
 

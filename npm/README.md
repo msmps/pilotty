@@ -1,25 +1,26 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/msmps/pilotty/main/assets/pilotty.png" alt="pilotty logo" width="400">
+  <img src="https://raw.githubusercontent.com/msmps/pilotty/main/assets/pilotty.png" alt="pilotty - Terminal automation CLI enabling AI agents to control TUI applications" width="400">
 </p>
 
 <h1 align="center">pilotty</h1>
 
 <p align="center">
+  <sub>The terminal equivalent of <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a></sub>
+</p>
+
+<p align="center">
   <strong>Terminal automation CLI for AI agents</strong><br>
-  <em>Like <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a>, but for TUI applications.</em>
+  <em>Control vim, htop, lazygit, dialog, and any TUI programmatically</em>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/pilotty"><img alt="npm version" src="https://img.shields.io/npm/v/pilotty"></a>
+  <a href="https://github.com/msmps/pilotty/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
 ---
 
-pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, captures terminal output, and provides keyboard/mouse input capabilities for navigating TUI applications.
-
-## Features
-
-- **PTY Management**: Spawn and manage terminal applications in background sessions
-- **Keyboard Navigation**: Interact with TUIs using Tab, Enter, arrow keys, and key combos
-- **AI-Friendly Output**: Clean JSON responses with actionable suggestions on errors
-- **Multi-Session**: Run multiple terminal apps simultaneously in isolated sessions
-- **Zero Config**: Daemon auto-starts on first command, auto-stops after 5 minutes idle
+pilotty enables AI agents to interact with terminal applications through a simple command-line interface. It manages pseudo-terminal (PTY) sessions with full VT100 terminal emulation, captures screen state, and provides keyboard/mouse input for navigating terminal user interfaces.
 
 ## Installation
 
@@ -83,6 +84,17 @@ The `snapshot` command returns structured data about the terminal screen:
 
 Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
 
+## Documentation
+
+See the **[GitHub repository](https://github.com/msmps/pilotty)** for full documentation including:
+
+- All commands reference
+- Session management
+- Key combinations
+- UI element detection
+- AI agent workflow examples
+- Daemon architecture
+
 ## Building from Source
 
 ```bash
@@ -93,10 +105,6 @@ cargo build --release
 ```
 
 Requires [Rust](https://rustup.rs) 1.70+.
-
-## Documentation
-
-See the [GitHub repository](https://github.com/msmps/pilotty) for full documentation including all commands, key combinations, and AI agent workflow examples.
 
 ## License
 
