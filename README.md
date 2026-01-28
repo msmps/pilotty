@@ -1,12 +1,16 @@
 <p align="center">
-  <img src="assets/pilotty.png" alt="pilotty logo" width="400">
+  <img src="assets/pilotty.png" alt="pilotty - Terminal automation CLI enabling AI agents to control TUI applications" width="400">
 </p>
 
 <h1 align="center">pilotty</h1>
 
 <p align="center">
+  <sub>The terminal equivalent of <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a></sub>
+</p>
+
+<p align="center">
   <strong>Terminal automation CLI for AI agents</strong><br>
-  <em>Like <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a>, but for TUI applications.</em>
+  <em>Control vim, htop, lazygit, dialog, and any TUI programmatically</em>
 </p>
 
 <p align="center">
@@ -21,15 +25,22 @@
 > [!NOTE]
 > **Built with AI, for AI.** This project was built with the support of an AI agent, planned thoroughly with a tight feedback loop and reviewed at each step. While we've tested extensively, edge cases may exist. Use in production at your own discretion, and please [report any issues](https://github.com/msmps/pilotty/issues) you find!
 
-pilotty enables AI agents to interact with terminal applications (vim, htop, lazygit, dialog, etc.) through a simple CLI interface. It manages PTY sessions, captures terminal output, and provides keyboard/mouse input capabilities for navigating TUI applications.
+pilotty enables AI agents to interact with terminal applications through a simple command-line interface. It manages pseudo-terminal (PTY) sessions with full VT100 terminal emulation, captures screen state, and provides keyboard/mouse input for navigating terminal user interfaces. Think of it as headless terminal automation for AI workflows.
 
 ## Features
 
-- **PTY Management**: Spawn and manage terminal applications in background sessions
+- **PTY (Pseudo-Terminal) Management**: Spawn and manage terminal applications in background sessions
+- **Terminal Emulation**: Full VT100 emulation for accurate screen capture and state tracking
 - **Keyboard Navigation**: Interact with TUIs using Tab, Enter, arrow keys, and key combos
 - **AI-Friendly Output**: Clean JSON responses with actionable suggestions on errors
 - **Multi-Session**: Run multiple terminal apps simultaneously in isolated sessions
 - **Zero Config**: Daemon auto-starts on first command, auto-stops after 5 minutes idle
+
+## Why pilotty?
+
+[agent-browser](https://github.com/vercel-labs/agent-browser) by Vercel Labs lets AI agents control web browsers. pilotty does the same for terminals.
+
+**Origin story:** Built to solve a personal problem, pilotty was created to enable AI agents to interact with [OpenTUI](https://github.com/anomalyco/opentui) interfaces and control [OpenCode](https://github.com/anomalyco/opencode) programmatically. If you're building TUIs or working with terminal applications, pilotty lets AI navigate them just like a human would.
 
 ## Installation
 
