@@ -511,8 +511,23 @@ async fn handle_request(
             cwd,
         } => handle_spawn(&request.id, &sessions, command, session_name, cwd).await,
 
-        Command::Snapshot { session, format } => {
-            handle_snapshot(&request.id, &sessions, session, format).await
+        Command::Snapshot {
+            session,
+            format,
+            await_change,
+            settle_ms,
+            timeout_ms,
+        } => {
+            handle_snapshot(
+                &request.id,
+                &sessions,
+                session,
+                format,
+                await_change,
+                settle_ms,
+                timeout_ms,
+            )
+            .await
         }
 
         Command::ListSessions => handle_list_sessions(&request.id, &sessions).await,
@@ -613,25 +628,123 @@ async fn handle_spawn(
     }
 }
 
+/// Poll interval for await_change/settle operations.
+const SNAPSHOT_POLL_INTERVAL_MS: u64 = 50;
+
 /// Handle snapshot command.
+///
+/// Supports optional wait-for-change semantics:
+/// - `await_change`: Block until content_hash differs from this value
+/// - `settle_ms`: After change detected, wait for screen to be stable this long
+/// - `timeout_ms`: Maximum time to wait for change/settle
 async fn handle_snapshot(
     request_id: &str,
     sessions: &SessionManager,
     session: Option<String>,
     format: Option<SnapshotFormat>,
+    await_change: Option<u64>,
+    settle_ms: u64,
+    timeout_ms: u64,
 ) -> Response {
-    // Resolve session
+    use std::time::{Duration, Instant};
+
+    // Resolve session first
     let session_id = match sessions.resolve_session(session.as_deref()).await {
         Ok(id) => id,
         Err(e) => return Response::error(request_id, e),
     };
 
     let format = format.unwrap_or(SnapshotFormat::Full);
-
-    // Full format includes UI element detection
     let with_elements = matches!(format, SnapshotFormat::Full);
+    let timeout = Duration::from_millis(timeout_ms);
+    let settle = Duration::from_millis(settle_ms);
+    let poll_interval = Duration::from_millis(SNAPSHOT_POLL_INTERVAL_MS);
+    let start = Instant::now();
 
-    // Get snapshot data (drains PTY output first)
+    // Track hash across phases (set during await_change, used by settle)
+    let mut current_hash: Option<u64> = None;
+
+    // Phase 1: If await_change is set, wait until content_hash differs
+    if let Some(baseline_hash) = await_change {
+        loop {
+            if start.elapsed() >= timeout {
+                return Response::error(
+                    request_id,
+                    ApiError::command_failed_with_suggestion(
+                        format!(
+                            "Timeout after {}ms waiting for screen to change from hash {}",
+                            timeout_ms,
+                            baseline_hash
+                        ),
+                        "Screen content did not change. The application may be idle or waiting for input.",
+                    ),
+                );
+            }
+
+            let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
+                Ok(data) => data,
+                Err(e) => return Response::error(request_id, e),
+            };
+
+            current_hash = snapshot.content_hash;
+            if current_hash != Some(baseline_hash) {
+                debug!(
+                    "Screen changed from hash {} to {:?} after {}ms",
+                    baseline_hash,
+                    current_hash,
+                    start.elapsed().as_millis()
+                );
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    // Phase 2: If settle_ms > 0, wait for screen stability
+    if settle_ms > 0 {
+        // Start from where await_change left off (or None if no await_change)
+        let mut last_hash = current_hash;
+        let mut stable_since = Instant::now();
+
+        loop {
+            if start.elapsed() >= timeout {
+                return Response::error(
+                    request_id,
+                    ApiError::command_failed_with_suggestion(
+                        format!(
+                            "Timeout after {}ms waiting for screen to stabilize for {}ms (last hash: {:?})",
+                            timeout_ms,
+                            settle_ms,
+                            last_hash
+                        ),
+                        "Screen kept changing. Try increasing --timeout or --settle.",
+                    ),
+                );
+            }
+
+            let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
+                Ok(data) => data,
+                Err(e) => return Response::error(request_id, e),
+            };
+
+            if snapshot.content_hash != last_hash {
+                last_hash = snapshot.content_hash;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() >= settle {
+                debug!(
+                    "Screen stabilized for {}ms after {}ms total",
+                    settle_ms,
+                    start.elapsed().as_millis()
+                );
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    // Phase 3: Take final snapshot with requested format
     let snapshot = match sessions.get_snapshot_data(&session_id, with_elements).await {
         Ok(data) => data,
         Err(e) => return Response::error(request_id, e),
@@ -640,7 +753,6 @@ async fn handle_snapshot(
 
     match format {
         SnapshotFormat::Text => {
-            // Format as plain text with cursor indicator
             let output =
                 format_text_snapshot(&snapshot.text, cursor_row, cursor_col, snapshot.size);
             Response::success(
@@ -652,9 +764,7 @@ async fn handle_snapshot(
             )
         }
         SnapshotFormat::Full => {
-            // Full: text + elements + metadata + content_hash
             let snapshot_id = sessions.next_snapshot_id();
-
             let screen_state = ScreenState {
                 snapshot_id,
                 size: TerminalSize {
@@ -673,7 +783,6 @@ async fn handle_snapshot(
             Response::success(request_id, ResponseData::ScreenState(screen_state))
         }
         SnapshotFormat::Compact => {
-            // Compact: metadata only, no text, elements, or hash
             let snapshot_id = sessions.next_snapshot_id();
             let screen_state = ScreenState {
                 snapshot_id,
@@ -1415,6 +1524,9 @@ mod tests {
             command: Command::Snapshot {
                 session: Some("test-snap".to_string()),
                 format: Some(SnapshotFormat::Text),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
             },
         };
         let snap_json = serde_json::to_string(&snap_request).unwrap();
@@ -1512,6 +1624,9 @@ mod tests {
             command: Command::Snapshot {
                 session: Some("full-test".to_string()),
                 format: Some(SnapshotFormat::Full),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
             },
         };
         let snap_json = serde_json::to_string(&snap_request).unwrap();
@@ -1656,6 +1771,9 @@ mod tests {
             command: Command::Snapshot {
                 session: Some("type-test".to_string()),
                 format: Some(SnapshotFormat::Text),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
             },
         };
         let snap_json = serde_json::to_string(&snap_request).unwrap();
@@ -2405,6 +2523,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_snapshot_await_change_detects_update() {
+        let temp_dir = std::env::temp_dir();
+        let socket_path =
+            temp_dir.join(format!("pilotty-await-change-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(10), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Spawn cat (echoes input)
+        let spawn_request = Request {
+            id: "spawn-1".to_string(),
+            command: Command::Spawn {
+                command: vec!["cat".to_string()],
+                session_name: Some("await-test".to_string()),
+                cwd: None,
+            },
+        };
+        let request_json = serde_json::to_string(&spawn_request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Take baseline snapshot to get initial hash
+        let snap_request = Request {
+            id: "snap-baseline".to_string(),
+            command: Command::Snapshot {
+                session: Some("await-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
+            },
+        };
+        let snap_json = serde_json::to_string(&snap_request).unwrap();
+        writer.write_all(snap_json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        let baseline_response: Response =
+            serde_json::from_str(&response_line).expect("parse baseline response");
+        assert!(
+            baseline_response.success,
+            "Baseline snapshot should succeed"
+        );
+
+        let baseline_hash = match baseline_response.data {
+            Some(ResponseData::ScreenState(state)) => state.content_hash.expect("should have hash"),
+            _ => panic!("Expected ScreenState"),
+        };
+
+        // Type something to change the screen
+        let type_request = Request {
+            id: "type-1".to_string(),
+            command: Command::Type {
+                text: "hello".to_string(),
+                session: Some("await-test".to_string()),
+            },
+        };
+        let type_json = serde_json::to_string(&type_request).unwrap();
+        writer.write_all(type_json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        // Request snapshot with await_change - should detect the change
+        let start = std::time::Instant::now();
+        let await_request = Request {
+            id: "snap-await".to_string(),
+            command: Command::Snapshot {
+                session: Some("await-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+                await_change: Some(baseline_hash),
+                settle_ms: 50,
+                timeout_ms: 5000,
+            },
+        };
+        let await_json = serde_json::to_string(&await_request).unwrap();
+        writer
+            .write_all(await_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+        let elapsed = start.elapsed();
+
+        let await_response: Response =
+            serde_json::from_str(&response_line).expect("parse await response");
+        assert!(await_response.success, "Await snapshot should succeed");
+
+        // Verify it detected change quickly (not timing out)
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Should detect change quickly, took {:?}",
+            elapsed
+        );
+
+        // Verify hash actually changed
+        if let Some(ResponseData::ScreenState(state)) = await_response.data {
+            assert_ne!(
+                state.content_hash,
+                Some(baseline_hash),
+                "Hash should have changed"
+            );
+            // Verify content contains what we typed
+            assert!(
+                state.text.as_ref().is_some_and(|t| t.contains("hello")),
+                "Text should contain 'hello'"
+            );
+        } else {
+            panic!("Expected ScreenState response");
+        }
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
     async fn test_spawn_with_invalid_cwd_fails() {
         let temp_dir = std::env::temp_dir();
         let socket_path = temp_dir.join(format!("pilotty-cwd-{}.sock", std::process::id()));
@@ -2534,6 +2811,9 @@ mod tests {
             command: Command::Snapshot {
                 session: Some("elem-test".to_string()),
                 format: Some(SnapshotFormat::Full),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
             },
         };
         let snap_json = serde_json::to_string(&snap_request).unwrap();

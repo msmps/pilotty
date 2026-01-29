@@ -37,7 +37,13 @@ Examples:
   pilotty snapshot                      # Snapshot default session (full JSON)
   pilotty snapshot --format compact     # JSON without text field
   pilotty snapshot --format text        # Plain text with cursor indicator
-  pilotty snapshot -s editor            # Snapshot a specific session")]
+  pilotty snapshot -s editor            # Snapshot a specific session
+
+Wait for change:
+  HASH=$(pilotty snapshot | jq -r '.content_hash')
+  pilotty key Enter
+  pilotty snapshot --await-change $HASH           # Block until screen changes
+  pilotty snapshot --await-change $HASH --settle 100  # Wait for 100ms stability")]
     Snapshot(SnapshotArgs),
 
     /// Type text at the current cursor position
@@ -147,6 +153,18 @@ pub struct SnapshotArgs {
 
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,
+
+    /// Block until content_hash differs from this value
+    #[arg(long, value_name = "HASH")]
+    pub await_change: Option<u64>,
+
+    /// Wait for screen to stabilize for this many ms before returning
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    pub settle: u64,
+
+    /// Timeout in milliseconds for await-change/settle (default: 30s)
+    #[arg(short, long, default_value_t = 30000)]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -68,6 +68,12 @@ pilotty snapshot                  # Full JSON with text content and elements
 pilotty snapshot --format compact # JSON without text field
 pilotty snapshot --format text    # Plain text with cursor indicator
 pilotty snapshot -s myapp         # Snapshot specific session
+
+# Wait for screen to change (eliminates need for sleep!)
+HASH=$(pilotty snapshot | jq '.content_hash')
+pilotty key Enter
+pilotty snapshot --await-change $HASH           # Block until screen changes
+pilotty snapshot --await-change $HASH --settle 50  # Wait for 50ms stability
 ```
 
 ### Input
@@ -120,10 +126,12 @@ pilotty wait-for "~" -s editor    # Wait in specific session
 |--------|-------------|
 | `-s, --session <name>` | Target specific session (default: "default") |
 | `--format <fmt>` | Snapshot format: full, compact, text |
-| `-t, --timeout <ms>` | Timeout for wait-for (default: 30000) |
+| `-t, --timeout <ms>` | Timeout for wait-for and await-change (default: 30000) |
 | `-r, --regex` | Treat wait-for pattern as regex |
 | `--name <name>` | Session name for spawn command |
 | `--delay <ms>` | Delay between keys in a sequence (default: 0, max: 10000) |
+| `--await-change <hash>` | Block snapshot until content_hash differs |
+| `--settle <ms>` | Wait for screen to be stable for this many ms (default: 0) |
 
 ### Environment variables
 
@@ -197,9 +205,39 @@ pilotty automatically detects interactive UI elements in terminal applications. 
 | **0.8** | Medium confidence: Bracket patterns `[OK]`, `<Cancel>` |
 | **0.6** | Lower confidence: Underscore input fields `____` |
 
-### Change Detection
+### Wait for Screen Changes (Recommended)
 
-The `content_hash` field enables efficient screen change detection:
+**Stop guessing sleep durations!** Use `--await-change` to wait for the screen to actually update:
+
+```bash
+# Capture baseline hash
+HASH=$(pilotty snapshot | jq '.content_hash')
+
+# Perform action
+pilotty key Enter
+
+# Wait for screen to change (blocks until hash differs)
+pilotty snapshot --await-change $HASH
+
+# Or wait for screen to stabilize (for apps that render progressively)
+pilotty snapshot --await-change $HASH --settle 100
+```
+
+**Flags:**
+| Flag | Description |
+|------|-------------|
+| `--await-change <HASH>` | Block until `content_hash` differs from this value |
+| `--settle <MS>` | After change detected, wait for screen to be stable for MS |
+| `--timeout <MS>` | Maximum wait time (default: 30000) |
+
+**Why this is better than sleep:**
+- `sleep 1` is a guess - too short causes race conditions, too long slows automation
+- `--await-change` waits exactly as long as needed - no more, no less
+- `--settle` handles apps that render progressively (show partial, then complete)
+
+### Manual Change Detection
+
+For manual polling (not recommended), use `content_hash` directly:
 
 ```bash
 # Get initial state
@@ -273,8 +311,9 @@ pilotty click 5 10        # Click at row 5, col 10
 # 1. Spawn vim
 pilotty spawn --name editor vim /tmp/hello.txt
 
-# 2. Wait for vim to load
+# 2. Wait for vim to load and capture baseline hash
 pilotty wait-for -s editor "hello.txt"
+HASH=$(pilotty snapshot -s editor | jq '.content_hash')
 
 # 3. Enter insert mode
 pilotty key -s editor i
@@ -282,7 +321,8 @@ pilotty key -s editor i
 # 4. Type content
 pilotty type -s editor "Hello from pilotty!"
 
-# 5. Exit insert mode and save (using key sequence)
+# 5. Wait for screen to update, then exit (no sleep needed!)
+pilotty snapshot -s editor --await-change $HASH --settle 50
 pilotty key -s editor "Escape : w q Enter"
 
 # 6. Verify session ended
@@ -306,19 +346,20 @@ pilotty spawn --name opts dialog --checklist "Select features:" 12 50 4 \
     "autosave" "Auto-save documents" on \
     "telemetry" "Usage analytics" off
 
-# 2. Wait for dialog to render
-sleep 0.5
+# 2. Wait for dialog to render (use await-change, not sleep!)
+pilotty snapshot -s opts --settle 200  # Wait for initial render to stabilize
 
-# 3. Get snapshot and examine elements
-pilotty snapshot -s opts | jq '.elements[] | select(.kind == "toggle")'
-# Shows toggle elements with checked state and positions
+# 3. Get snapshot and examine elements, capture hash
+SNAP=$(pilotty snapshot -s opts)
+echo "$SNAP" | jq '.elements[] | select(.kind == "toggle")'
+HASH=$(echo "$SNAP" | jq '.content_hash')
 
 # 4. Navigate to "darkmode" and toggle it
 pilotty key -s opts Down      # Move to second option
 pilotty key -s opts Space     # Toggle it on
 
-# 5. Verify the change
-pilotty snapshot -s opts | jq '.elements[] | select(.kind == "toggle") | {text, checked}'
+# 5. Wait for change and verify
+pilotty snapshot -s opts --await-change $HASH | jq '.elements[] | select(.kind == "toggle") | {text, checked}'
 
 # 6. Confirm selection
 pilotty key -s opts Enter
@@ -439,6 +480,18 @@ Errors include actionable suggestions:
 ---
 
 ## Common Patterns
+
+### Reliable action + wait (recommended)
+
+```bash
+# The pattern: capture hash, act, await change
+HASH=$(pilotty snapshot | jq '.content_hash')
+pilotty key Enter
+pilotty snapshot --await-change $HASH --settle 50
+
+# This replaces fragile patterns like:
+# pilotty key Enter && sleep 1 && pilotty snapshot  # BAD: guessing
+```
 
 ### Wait then act
 

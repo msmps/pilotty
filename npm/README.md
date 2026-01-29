@@ -51,6 +51,11 @@ pilotty key Ctrl+C
 pilotty key "Ctrl+X m"            # Emacs chord
 pilotty key "Escape : w q Enter"  # vim :wq
 
+# Wait for screen to change (no more guessing sleep durations!)
+HASH=$(pilotty snapshot | jq '.content_hash')
+pilotty key Enter
+pilotty snapshot --await-change $HASH --settle 50
+
 # Click at specific coordinates (row, col)
 pilotty click 10 5
 

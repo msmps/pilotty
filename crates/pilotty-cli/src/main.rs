@@ -56,6 +56,9 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
                 crate::args::SnapshotFormat::Compact => SnapshotFormat::Compact,
                 crate::args::SnapshotFormat::Text => SnapshotFormat::Text,
             }),
+            await_change: args.await_change,
+            settle_ms: args.settle,
+            timeout_ms: args.timeout,
         }),
         Commands::Type(args) => Some(Command::Type {
             text: args.text.clone(),
