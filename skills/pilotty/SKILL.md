@@ -228,12 +228,39 @@ pilotty snapshot --await-change $HASH --settle 100
 |------|-------------|
 | `--await-change <HASH>` | Block until `content_hash` differs from this value |
 | `--settle <MS>` | After change detected, wait for screen to be stable for MS |
-| `--timeout <MS>` | Maximum wait time (default: 30000) |
+| `-t, --timeout <MS>` | Maximum wait time (default: 30000) |
 
 **Why this is better than sleep:**
 - `sleep 1` is a guess - too short causes race conditions, too long slows automation
 - `--await-change` waits exactly as long as needed - no more, no less
 - `--settle` handles apps that render progressively (show partial, then complete)
+
+### Waiting for Streaming AI Responses
+
+When interacting with AI-powered TUIs (like opencode, etc.) that stream responses, you need a longer `--settle` time since the screen keeps updating as tokens arrive:
+
+```bash
+# 1. Capture hash before sending prompt
+HASH=$(pilotty snapshot -s myapp | jq -r '.content_hash')
+
+# 2. Type prompt and submit
+pilotty type -s myapp "write me a poem about ai agents"
+pilotty key -s myapp Enter
+
+# 3. Wait for streaming response to complete
+#    - Use longer settle (2-3s) since AI apps pause between chunks
+#    - Extend timeout for long responses (60s+)
+pilotty snapshot -s myapp --await-change "$HASH" --settle 3000 -t 60000
+
+# 4. Response may be scrolled - scroll up if needed to see full output
+pilotty scroll -s myapp up 10
+pilotty snapshot -s myapp --format text
+```
+
+**Key parameters for streaming:**
+- `--settle 2000-3000`: AI responses have pauses between chunks; 2-3 seconds ensures streaming is truly done
+- `-t 60000`: Extend timeout beyond the 30s default for longer generations
+- The settle timer resets on each screen change, so it naturally waits until streaming stops
 
 ### Manual Change Detection
 
@@ -416,6 +443,43 @@ pilotty key -s monitor q     # Quit
 # 5. Kill session
 pilotty kill -s monitor
 ```
+
+## Example: Interact with AI TUI (opencode, etc.)
+
+AI-powered TUIs stream responses, requiring special handling:
+
+```bash
+# 1. Spawn the AI app
+pilotty spawn --name ai opencode
+
+# 2. Wait for the prompt to be ready
+pilotty wait-for -s ai "Ask anything" -t 15000
+
+# 3. Capture baseline hash
+HASH=$(pilotty snapshot -s ai | jq -r '.content_hash')
+
+# 4. Type prompt and submit
+pilotty type -s ai "explain the architecture of this codebase"
+pilotty key -s ai Enter
+
+# 5. Wait for streaming response to complete
+#    - settle=3000: Wait 3s of no changes to ensure streaming is done
+#    - timeout=60000: Allow up to 60s for long responses
+pilotty snapshot -s ai --await-change "$HASH" --settle 3000 -t 60000 --format text
+
+# 6. If response is long and scrolled, scroll up to see full output
+pilotty scroll -s ai up 20
+pilotty snapshot -s ai --format text
+
+# 7. Clean up
+pilotty kill -s ai
+```
+
+**Gotchas with AI apps:**
+- Use `--settle 2000-3000` because AI responses pause between chunks
+- Extend timeout with `-t 60000` for complex prompts
+- Long responses may scroll the terminal; use `scroll up` to see the beginning
+- The settle timer resets on each screen update, so it waits for true completion
 
 ---
 
