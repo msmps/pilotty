@@ -377,6 +377,13 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 /// Maximum scroll amount to prevent long-running requests.
 const MAX_SCROLL_AMOUNT: u32 = 1000;
 
+/// Maximum delay between keys in a sequence (10 seconds).
+/// Allows time for slow TUI animations while preventing DoS.
+const MAX_KEY_DELAY_MS: u32 = 10_000;
+
+/// Maximum keys in a sequence to prevent long-running requests.
+const MAX_KEY_SEQUENCE_LEN: usize = 100;
+
 /// Read a line with a maximum size limit to prevent memory DoS.
 ///
 /// Returns the number of bytes read (0 means EOF).
@@ -514,7 +521,11 @@ async fn handle_request(
 
         Command::Type { text, session } => handle_type(&request.id, &sessions, text, session).await,
 
-        Command::Key { key, session } => handle_key(&request.id, &sessions, key, session).await,
+        Command::Key {
+            key,
+            delay_ms,
+            session,
+        } => handle_key(&request.id, &sessions, key, delay_ms, session).await,
 
         Command::Click { row, col, session } => {
             handle_click(&request.id, &sessions, row, col, session).await
@@ -818,14 +829,32 @@ async fn handle_type(
     }
 }
 
-/// Handle key command - send key or key combo to PTY.
+/// Handle key command - send key, key combo, or key sequence to PTY.
+///
+/// Supports space-separated key sequences like "Ctrl+X m" for chords.
+/// If delay_ms > 0, waits that many milliseconds between each key in a sequence.
 async fn handle_key(
     request_id: &str,
     sessions: &SessionManager,
     key: String,
+    delay_ms: u32,
     session: Option<String>,
 ) -> Response {
-    use pilotty_core::input::{key_to_bytes, parse_key_combo};
+    use pilotty_core::input::parse_key_sequence;
+
+    // Validate delay_ms to prevent DoS
+    if delay_ms > MAX_KEY_DELAY_MS {
+        return Response::error(
+            request_id,
+            ApiError::invalid_input_with_suggestion(
+                format!(
+                    "Key delay {}ms exceeds maximum {}ms",
+                    delay_ms, MAX_KEY_DELAY_MS
+                ),
+                "Use a smaller delay (<= 10000ms). For longer waits, use multiple key commands.",
+            ),
+        );
+    }
 
     // Resolve session
     let session_id = match sessions.resolve_session(session.as_deref()).await {
@@ -841,50 +870,61 @@ async fn handle_key(
         .await
         .unwrap_or(false);
 
-    // Try to parse the key
-    // Note: We check for combos only if there's a `+` that's not the entire key
-    // This allows sending literal `+` as a single character
-    let bytes = if key.len() > 1 && key.contains('+') {
-        // Key combo like Ctrl+C (but not a literal "+")
-        parse_key_combo(&key, app_cursor)
-    } else {
-        // Named key like Enter, Plus, or single character (including "+")
-        key_to_bytes(&key, app_cursor).or_else(|| {
-            // Fall back to single character
-            if key.len() == 1 {
-                Some(key.as_bytes().to_vec())
-            } else {
-                None
-            }
-        })
+    // Parse key sequence (handles single keys, combos, and space-separated sequences)
+    let sequence = match parse_key_sequence(&key, app_cursor) {
+        Some(seq) => seq,
+        None => {
+            return Response::error(
+                request_id,
+                ApiError::invalid_input_with_suggestion(
+                    format!("Invalid key: '{}'", key),
+                    "Use named keys (Enter, Tab, Escape, F1), combos (Ctrl+C, Alt+F), \
+                     or space-separated sequences (\"Ctrl+X m\"). Run 'pilotty key --help' for examples.",
+                ),
+            );
+        }
     };
 
-    match bytes {
-        Some(bytes) => match sessions.write_to_session(&session_id, &bytes).await {
-            Ok(()) => {
-                debug!(
-                    "Sent key '{}' ({} bytes) to session {}",
-                    key,
-                    bytes.len(),
-                    session_id
-                );
-                Response::success(
-                    request_id,
-                    ResponseData::Ok {
-                        message: format!("Sent key: {}", key),
-                    },
-                )
-            }
-            Err(e) => Response::error(request_id, e),
-        },
-        None => Response::error(
+    // Validate sequence length to prevent DoS
+    if sequence.len() > MAX_KEY_SEQUENCE_LEN {
+        return Response::error(
             request_id,
-            ApiError::invalid_input(format!(
-                "Unknown key: '{}'. Try named keys like Enter, Tab, Escape, Up, Down, F1, etc. or combos like Ctrl+C",
-                key
-            )),
-        ),
+            ApiError::invalid_input_with_suggestion(
+                format!(
+                    "Key sequence has {} keys, maximum is {}",
+                    sequence.len(),
+                    MAX_KEY_SEQUENCE_LEN
+                ),
+                "Split long sequences into multiple key commands.",
+            ),
+        );
     }
+
+    // Send each key in the sequence
+    let key_count = sequence.len();
+    for (i, bytes) in sequence.into_iter().enumerate() {
+        // Apply inter-key delay (but not before the first key)
+        if i > 0 && delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(u64::from(delay_ms))).await;
+        }
+
+        if let Err(e) = sessions.write_to_session(&session_id, &bytes).await {
+            return Response::error(request_id, e);
+        }
+    }
+
+    debug!(
+        "Sent {} key(s) '{}' to session {}",
+        key_count, key, session_id
+    );
+
+    let message = if key_count == 1 {
+        format!("Sent key: {}", key)
+    } else {
+        format!("Sent {} keys: {}", key_count, key)
+    };
+
+    Response::success(request_id, ResponseData::Ok { message })
 }
 
 /// Handle click command - click at a specific row/column coordinate.
@@ -1700,6 +1740,7 @@ mod tests {
             id: "key-1".to_string(),
             command: Command::Key {
                 key: "Enter".to_string(),
+                delay_ms: 0,
                 session: Some("key-test".to_string()),
             },
         };
@@ -1723,6 +1764,7 @@ mod tests {
             id: "key-2".to_string(),
             command: Command::Key {
                 key: "Ctrl+C".to_string(),
+                delay_ms: 0,
                 session: Some("key-test".to_string()),
             },
         };
@@ -1746,6 +1788,63 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn test_key_rejects_large_delay() {
+        let short_id = Uuid::new_v4().simple().to_string();
+        let socket_path = std::path::PathBuf::from("/tmp")
+            .join(format!("pilotty-keydelay-{}.sock", &short_id[..8]));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(2), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Try to send a key with delay exceeding MAX_KEY_DELAY_MS (10000)
+        let request = Request {
+            id: "key-delay-1".to_string(),
+            command: Command::Key {
+                key: "a b".to_string(),
+                delay_ms: MAX_KEY_DELAY_MS + 1,
+                session: None,
+            },
+        };
+        let request_json = serde_json::to_string(&request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        let response: Response = serde_json::from_str(&response_line).expect("parse response");
+        assert!(!response.success);
+        let error = response.error.expect("error response");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("exceeds maximum"));
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
     }
 
     #[tokio::test]

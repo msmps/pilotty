@@ -76,7 +76,9 @@ pub fn encode_text(text: &str) -> Vec<u8> {
 /// via DECCKM (`ESC[?1h`), and arrow keys must use SS3 encoding to work.
 ///
 /// Returns the escape sequence for a named key, or None if not recognized.
-pub fn key_to_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
+///
+/// Note: Internal function. Use `parse_key_sequence` for the public API.
+fn key_to_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
     // Normalize key name (case insensitive)
     let key_lower = key.to_lowercase();
     let key_str = key_lower.as_str();
@@ -160,7 +162,9 @@ pub fn key_to_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
 /// - Alt+<key>: Escape prefix + key (Alt+F = ESC f)
 /// - Shift+<key>: Uppercase for letters, otherwise ignored
 /// - Combinations: Ctrl+Alt+<key>, etc.
-pub fn parse_key_combo(combo: &str, application_cursor: bool) -> Option<Vec<u8>> {
+///
+/// Note: Internal function. Use `parse_key_sequence` for the public API.
+fn parse_key_combo(combo: &str, application_cursor: bool) -> Option<Vec<u8>> {
     let parts: Vec<&str> = combo.split('+').collect();
 
     if parts.is_empty() {
@@ -283,6 +287,58 @@ pub fn encode_mouse_click_combined(x: u16, y: u16) -> Vec<u8> {
     let mut result = press;
     result.extend(release);
     result
+}
+
+/// Parse a key sequence like "Ctrl+X m" into a list of byte sequences.
+///
+/// Keys are space-separated. Each key can be:
+/// - A combo: `Ctrl+X`, `Alt+F`, `Ctrl+Alt+C`
+/// - A named key: `Enter`, `Escape`, `Tab`, `F1`, `Space`
+/// - A single character: `a`, `m`, `:`
+///
+/// The `application_cursor` parameter affects arrow key encoding.
+///
+/// # Examples
+///
+/// ```
+/// use pilotty_core::input::parse_key_sequence;
+///
+/// // Emacs chord: Ctrl+X then m
+/// let seq = parse_key_sequence("Ctrl+X m", false).unwrap();
+/// assert_eq!(seq.len(), 2);
+///
+/// // vim :wq
+/// let seq = parse_key_sequence("Escape : w q Enter", false).unwrap();
+/// assert_eq!(seq.len(), 5);
+///
+/// // Single key still works
+/// let seq = parse_key_sequence("Enter", false).unwrap();
+/// assert_eq!(seq.len(), 1);
+/// ```
+pub fn parse_key_sequence(sequence: &str, application_cursor: bool) -> Option<Vec<Vec<u8>>> {
+    let parts: Vec<&str> = sequence.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(parts.len());
+    for part in parts {
+        // Try combo first (Ctrl+X), then named key (Enter), then single char
+        let bytes = parse_key_combo(part, application_cursor)
+            .or_else(|| key_to_bytes(part, application_cursor))
+            .or_else(|| {
+                // Single character fallback (avoids Vec allocation)
+                let mut chars = part.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c.to_string().into_bytes()),
+                    _ => None,
+                }
+            })?;
+        result.push(bytes);
+    }
+
+    Some(result)
 }
 
 /// Generate scroll wheel sequences.
@@ -489,5 +545,90 @@ mod tests {
         let scroll = encode_scroll(ScrollDirection::Down, 10, 5);
         // Button 65 for scroll down
         assert_eq!(scroll, b"\x1b[<65;11;6M");
+    }
+
+    #[test]
+    fn test_parse_key_sequence_single_key() {
+        // Single key should work (backward compatible)
+        let seq = parse_key_sequence("Enter", false).unwrap();
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0], b"\r".to_vec());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_single_combo() {
+        let seq = parse_key_sequence("Ctrl+C", false).unwrap();
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0], vec![0x03]);
+    }
+
+    #[test]
+    fn test_parse_key_sequence_emacs_chord() {
+        // Ctrl+X then m (emacs-style chord)
+        let seq = parse_key_sequence("Ctrl+X m", false).unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0], vec![0x18]); // Ctrl+X
+        assert_eq!(seq[1], b"m".to_vec());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_vim_wq() {
+        // vim :wq sequence
+        let seq = parse_key_sequence("Escape : w q Enter", false).unwrap();
+        assert_eq!(seq.len(), 5);
+        assert_eq!(seq[0], vec![0x1b]); // Escape
+        assert_eq!(seq[1], b":".to_vec());
+        assert_eq!(seq[2], b"w".to_vec());
+        assert_eq!(seq[3], b"q".to_vec());
+        assert_eq!(seq[4], b"\r".to_vec()); // Enter
+    }
+
+    #[test]
+    fn test_parse_key_sequence_emacs_save() {
+        // Ctrl+X Ctrl+S (emacs save)
+        let seq = parse_key_sequence("Ctrl+X Ctrl+S", false).unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0], vec![0x18]); // Ctrl+X
+        assert_eq!(seq[1], vec![0x13]); // Ctrl+S
+    }
+
+    #[test]
+    fn test_parse_key_sequence_with_space_key() {
+        // "a Space b" should send 'a', then space, then 'b'
+        let seq = parse_key_sequence("a Space b", false).unwrap();
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq[0], b"a".to_vec());
+        assert_eq!(seq[1], b" ".to_vec()); // Space is a named key
+        assert_eq!(seq[2], b"b".to_vec());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_handles_extra_whitespace() {
+        // Multiple spaces between keys should be handled
+        let seq = parse_key_sequence("Ctrl+X   m", false).unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0], vec![0x18]);
+        assert_eq!(seq[1], b"m".to_vec());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_empty_returns_none() {
+        assert!(parse_key_sequence("", false).is_none());
+        assert!(parse_key_sequence("   ", false).is_none());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_invalid_key_returns_none() {
+        // "NotAKey" is not a valid single char or named key
+        assert!(parse_key_sequence("Ctrl+X NotAKey", false).is_none());
+    }
+
+    #[test]
+    fn test_parse_key_sequence_application_cursor_mode() {
+        // Arrow keys in application cursor mode
+        let seq = parse_key_sequence("Up Down", true).unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0], b"\x1bOA".to_vec()); // SS3 sequence
+        assert_eq!(seq[1], b"\x1bOB".to_vec());
     }
 }

@@ -19,9 +19,15 @@ target/
 .opencode/
 .claude/
 .agents/
+AGENTS.md
+**/AGENTS.md
 
 # Internal docs (not for public repo)
 docs/
+TODO*.md
+
+# Examples (local dev only)
+examples/
 
 # npm - binaries are downloaded during release
 npm/bin/pilotty-*
