@@ -5,8 +5,10 @@ Complete reference for key combinations supported by `pilotty key`.
 ## Basic Usage
 
 ```bash
-pilotty key <key>                 # Send to default session
+pilotty key <key>                 # Send single key to default session
 pilotty key -s myapp <key>        # Send to specific session
+pilotty key "key1 key2 key3"      # Send key sequence (space-separated)
+pilotty key "key1 key2" --delay 50  # Sequence with 50ms delay between keys
 ```
 
 ## Named Keys
@@ -117,6 +119,51 @@ pilotty key -s myapp <key>        # Send to specific session
 |-----|-------------|
 | `Plus` | Literal `+` character |
 
+## Key Sequences
+
+Send multiple keys in order with a single command. Keys are space-separated:
+
+```bash
+# Emacs-style chords
+pilotty key "Ctrl+X Ctrl+S"       # Save file
+pilotty key "Ctrl+X Ctrl+C"       # Exit Emacs
+pilotty key "Ctrl+X m"            # Compose mail
+
+# vim command sequences
+pilotty key "Escape : w q Enter"  # Save and quit
+pilotty key "Escape : q ! Enter"  # Quit without saving
+pilotty key "g g d G"             # Delete entire file
+
+# Navigation sequences
+pilotty key "Tab Tab Enter"       # Tab twice then Enter
+pilotty key "Down Down Space"     # Move down twice and select
+```
+
+### Inter-key Delay
+
+Use `--delay` for TUIs that need time between keys:
+
+```bash
+pilotty key "Tab Tab Enter" --delay 100   # 100ms between each key
+pilotty key "F9 Down Enter" --delay 50    # htop kill menu navigation
+```
+
+| Option | Description |
+|--------|-------------|
+| `--delay <ms>` | Milliseconds between keys (default: 0, max: 10000) |
+
+### When to Use Sequences vs Individual Keys
+
+**Use sequences** for:
+- Emacs/vim chords that must be sent together
+- Predictable navigation patterns
+- Reducing command overhead
+
+**Use individual keys** when:
+- You need to check screen state between keys
+- Timing is unpredictable
+- Different paths based on UI state
+
 ## Common TUI Patterns
 
 ### Dialog/Whiptail
@@ -136,6 +183,12 @@ pilotty key Escape    # Normal mode
 pilotty key Ctrl+C    # Also exits insert mode
 pilotty type ":wq"    # Command (then Enter)
 pilotty key Enter
+
+# Using sequences for common operations
+pilotty key "Escape : w q Enter"     # Save and quit
+pilotty key "Escape : q ! Enter"     # Force quit
+pilotty key "Escape d d"             # Delete line
+pilotty key "Escape g g"             # Go to top
 ```
 
 ### Htop
@@ -168,6 +221,10 @@ pilotty key Ctrl+X    # Exit
 pilotty key Ctrl+K    # Cut line
 pilotty key Ctrl+U    # Paste
 pilotty key Ctrl+W    # Search
+
+# Using sequences
+pilotty key "Ctrl+O Enter"    # Save with default filename
+pilotty key "Ctrl+X n"        # Exit without saving (answer 'n' to save prompt)
 ```
 
 ### Tmux (default prefix)
@@ -179,6 +236,11 @@ pilotty key c         # New window
 pilotty key n         # Next window
 pilotty key p         # Previous window
 pilotty key d         # Detach
+
+# Using sequences for tmux commands
+pilotty key "Ctrl+B c"    # Prefix + new window
+pilotty key "Ctrl+B n"    # Prefix + next window
+pilotty key "Ctrl+B d"    # Prefix + detach
 ```
 
 ### Readline/Bash

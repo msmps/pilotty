@@ -84,6 +84,12 @@ pilotty key F1                    # Function key
 pilotty key Alt+F                 # Alt combination
 pilotty key Up                    # Arrow key
 pilotty key -s myapp Ctrl+S       # Key in specific session
+
+# Key sequences (space-separated, sent in order)
+pilotty key "Ctrl+X m"            # Emacs chord: Ctrl+X then m
+pilotty key "Escape : w q Enter"  # vim :wq sequence
+pilotty key "a b c" --delay 50    # Send a, b, c with 50ms delay
+pilotty key -s myapp "Tab Tab Enter"  # Sequence in specific session
 ```
 
 ### Interaction
@@ -117,6 +123,7 @@ pilotty wait-for "~" -s editor    # Wait in specific session
 | `-t, --timeout <ms>` | Timeout for wait-for (default: 30000) |
 | `-r, --regex` | Treat wait-for pattern as regex |
 | `--name <name>` | Session name for spawn command |
+| `--delay <ms>` | Delay between keys in a sequence (default: 0, max: 10000) |
 
 ### Environment variables
 
@@ -275,15 +282,18 @@ pilotty key -s editor i
 # 4. Type content
 pilotty type -s editor "Hello from pilotty!"
 
-# 5. Exit insert mode
-pilotty key -s editor Escape
+# 5. Exit insert mode and save (using key sequence)
+pilotty key -s editor "Escape : w q Enter"
 
-# 6. Save and quit
+# 6. Verify session ended
+pilotty list-sessions
+```
+
+Alternative using individual keys:
+```bash
+pilotty key -s editor Escape
 pilotty type -s editor ":wq"
 pilotty key -s editor Enter
-
-# 7. Verify session ended
-pilotty list-sessions
 ```
 
 ## Example: Dialog checklist interaction
