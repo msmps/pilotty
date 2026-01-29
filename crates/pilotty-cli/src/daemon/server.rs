@@ -657,12 +657,14 @@ async fn handle_snapshot(
     let format = format.unwrap_or(SnapshotFormat::Full);
     let with_elements = matches!(format, SnapshotFormat::Full);
     let timeout = Duration::from_millis(timeout_ms);
-    let settle = Duration::from_millis(settle_ms);
+    // Settle must be at least one poll interval to be meaningful
+    let settle = Duration::from_millis(if settle_ms > 0 {
+        settle_ms.max(SNAPSHOT_POLL_INTERVAL_MS)
+    } else {
+        0
+    });
     let poll_interval = Duration::from_millis(SNAPSHOT_POLL_INTERVAL_MS);
     let start = Instant::now();
-
-    // Track hash across phases (set during await_change, used by settle)
-    let mut current_hash: Option<u64> = None;
 
     // Phase 1: If await_change is set, wait until content_hash differs
     if let Some(baseline_hash) = await_change {
@@ -686,12 +688,11 @@ async fn handle_snapshot(
                 Err(e) => return Response::error(request_id, e),
             };
 
-            current_hash = snapshot.content_hash;
-            if current_hash != Some(baseline_hash) {
+            if snapshot.content_hash != Some(baseline_hash) {
                 debug!(
                     "Screen changed from hash {} to {:?} after {}ms",
                     baseline_hash,
-                    current_hash,
+                    snapshot.content_hash,
                     start.elapsed().as_millis()
                 );
                 break;
@@ -703,8 +704,12 @@ async fn handle_snapshot(
 
     // Phase 2: If settle_ms > 0, wait for screen stability
     if settle_ms > 0 {
-        // Start from where await_change left off (or None if no await_change)
-        let mut last_hash = current_hash;
+        // Get fresh snapshot - don't rely on potentially stale hash from Phase 1
+        let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
+            Ok(data) => data,
+            Err(e) => return Response::error(request_id, e),
+        };
+        let mut last_hash = snapshot.content_hash;
         let mut stable_since = Instant::now();
 
         loop {

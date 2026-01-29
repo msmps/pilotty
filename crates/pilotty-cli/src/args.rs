@@ -162,7 +162,7 @@ pub struct SnapshotArgs {
     #[arg(long, default_value_t = 0, value_name = "MS")]
     pub settle: u64,
 
-    /// Timeout in milliseconds for await-change/settle (default: 30s)
+    /// Total timeout in milliseconds for await-change and settle combined (default: 30s)
     #[arg(short, long, default_value_t = 30000)]
     pub timeout: u64,
 }
