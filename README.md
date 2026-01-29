@@ -121,6 +121,10 @@ pilotty examples                  # Show end-to-end workflow example
 pilotty snapshot                  # Full JSON with text
 pilotty snapshot --format compact # JSON without text field
 pilotty snapshot --format text    # Plain text with cursor indicator
+
+# Wait for screen to change before returning (no more manual sleep!)
+pilotty snapshot --await-change $HASH           # Block until hash differs
+pilotty snapshot --await-change $HASH --settle 100  # Then wait for stability
 ```
 
 ### Input
@@ -155,6 +159,11 @@ pilotty resize 120 40             # Resize terminal to 120x40
 pilotty wait-for "Ready"          # Wait for text to appear
 pilotty wait-for "Error" --regex  # Wait for regex pattern
 pilotty wait-for "Done" -t 5000   # Wait with 5s timeout
+
+# Wait for screen changes (preferred over sleep)
+HASH=$(pilotty snapshot | jq '.content_hash')
+pilotty key Enter
+pilotty snapshot --await-change $HASH --settle 50  # Wait for change + 50ms stability
 ```
 
 ## Snapshot Output
@@ -204,9 +213,57 @@ pilotty automatically detects interactive UI elements in terminal applications. 
 | `focused` | Whether element has focus (only present if true) |
 | `checked` | Toggle state (only present for toggles) |
 
-### Change Detection
+### Wait for Screen Changes
 
-The `content_hash` field enables screen change detection between snapshots:
+The `--await-change` flag solves the fundamental problem of TUI automation: **"How long should I wait after an action?"**
+
+Instead of guessing sleep durations (too short = race condition, too long = slow), wait for the screen to actually change:
+
+```bash
+# Capture baseline hash
+HASH=$(pilotty snapshot | jq '.content_hash')
+
+# Perform action
+pilotty key Enter
+
+# Wait for screen to change (blocks until hash differs)
+pilotty snapshot --await-change $HASH
+
+# Or wait for screen to stabilize (useful for apps that render progressively)
+pilotty snapshot --await-change $HASH --settle 100  # Wait 100ms after last change
+```
+
+**Flags:**
+- `--await-change <HASH>`: Block until `content_hash` differs from this value
+- `--settle <MS>`: After change detected, wait for screen to be stable for this many ms
+- `-t, --timeout <MS>`: Maximum wait time (default: 30000)
+
+**Why this matters:**
+- No more flaky automation due to race conditions
+- No more slow scripts due to conservative sleep values  
+- Works regardless of how fast/slow the target app is
+- The `--settle` flag handles apps that render progressively
+
+### Streaming AI Responses
+
+For AI-powered TUIs that stream responses (opencode, etc.), use longer settle times:
+
+```bash
+HASH=$(pilotty snapshot -s ai | jq -r '.content_hash')
+pilotty type -s ai "explain this code"
+pilotty key -s ai Enter
+
+# Wait for streaming to complete: 3s settle, 60s timeout
+pilotty snapshot -s ai --await-change "$HASH" --settle 3000 -t 60000
+```
+
+- Use `--settle 2000-3000` because AI responses pause between chunks
+- Extend timeout with `-t 60000` for longer generations
+- Long responses may scroll; use `pilotty scroll up` to see the full output
+
+### Manual Change Detection
+
+For manual polling, use `content_hash` directly:
 
 ```bash
 # Get initial snapshot
@@ -389,18 +446,47 @@ pilotty spawn vim myfile.txt
 # 2. Wait for it to be ready
 pilotty wait-for "myfile.txt"
 
-# 3. Take a snapshot to understand the screen
-pilotty snapshot
+# 3. Take a snapshot to understand the screen and capture hash
+HASH=$(pilotty snapshot | jq '.content_hash')
 
 # 4. Navigate using keyboard commands
 pilotty key i                    # Enter insert mode
 pilotty type "Hello, World!"
 pilotty key Escape
-pilotty type ":wq"
-pilotty key Enter
 
-# 5. Re-snapshot after screen changes
-pilotty snapshot
+# 5. Wait for screen to update, then save (no manual sleep needed!)
+pilotty snapshot --await-change $HASH --settle 50
+pilotty key "Escape : w q Enter"  # vim :wq sequence
+
+# 6. Verify vim exited
+pilotty list-sessions
+```
+
+### Example: AI TUI Interaction
+
+For AI-powered terminal apps that stream responses:
+
+```bash
+# 1. Spawn the AI app
+pilotty spawn --name ai opencode
+
+# 2. Wait for prompt
+pilotty wait-for -s ai "Ask anything" -t 15000
+
+# 3. Capture baseline hash, type prompt, submit
+HASH=$(pilotty snapshot -s ai | jq -r '.content_hash')
+pilotty type -s ai "write a haiku about rust"
+pilotty key -s ai Enter
+
+# 4. Wait for streaming response (3s settle, 60s timeout)
+pilotty snapshot -s ai --await-change "$HASH" --settle 3000 -t 60000 --format text
+
+# 5. Scroll up if response is long
+pilotty scroll -s ai up 10
+pilotty snapshot -s ai --format text
+
+# 6. Clean up
+pilotty kill -s ai
 ```
 
 ## Key Combinations

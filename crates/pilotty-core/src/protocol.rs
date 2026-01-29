@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 use crate::snapshot::ScreenState;
 
+/// Default timeout for snapshot await_change/settle operations (30 seconds).
+fn default_snapshot_timeout() -> u64 {
+    30000
+}
+
 /// A request from CLI to daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -30,9 +35,21 @@ pub enum Command {
     /// Kill a session.
     Kill { session: Option<String> },
     /// Get a snapshot of the terminal screen.
+    ///
+    /// Optionally block until the screen changes from a baseline hash and/or
+    /// stabilizes for a specified duration.
     Snapshot {
         session: Option<String>,
         format: Option<SnapshotFormat>,
+        /// If set, block until content_hash differs from this value.
+        #[serde(default)]
+        await_change: Option<u64>,
+        /// Wait for screen to be stable for this many ms before returning.
+        #[serde(default)]
+        settle_ms: u64,
+        /// Timeout in ms for await_change/settle operations.
+        #[serde(default = "default_snapshot_timeout")]
+        timeout_ms: u64,
     },
     /// Type text at cursor.
     Type {
