@@ -382,7 +382,7 @@ const MAX_SCROLL_AMOUNT: u32 = 1000;
 const MAX_KEY_DELAY_MS: u32 = 10_000;
 
 /// Maximum keys in a sequence to prevent long-running requests.
-const MAX_KEY_SEQUENCE_LEN: usize = 100;
+const MAX_KEY_SEQUENCE_LEN: usize = 32;
 
 /// Read a line with a maximum size limit to prevent memory DoS.
 ///
@@ -895,7 +895,7 @@ async fn handle_key(
                     sequence.len(),
                     MAX_KEY_SEQUENCE_LEN
                 ),
-                "Split long sequences into multiple key commands.",
+                "Split long sequences into multiple key commands (max 32 keys).",
             ),
         );
     }
