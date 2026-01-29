@@ -133,6 +133,11 @@ pilotty key Alt+F                 # Send Alt+F
 pilotty key F1                    # Send function key
 pilotty key Tab                   # Send Tab
 pilotty key Escape                # Send Escape
+
+# Key sequences (space-separated keys sent in order)
+pilotty key "Ctrl+X m"            # Emacs chord: Ctrl+X then m
+pilotty key "Escape : w q Enter"  # vim :wq sequence
+pilotty key "a b c" --delay 50    # Send a, b, c with 50ms delay between
 ```
 
 ### Interaction
@@ -414,6 +419,26 @@ Supported key formats:
 | Combined | `Ctrl+Alt+C` | |
 | Special | `Plus` | Literal `+` character |
 | Aliases | `Return` = `Enter`, `Esc` = `Escape` | |
+| **Sequences** | `"Ctrl+X m"`, `"Escape : w q Enter"` | Space-separated keys |
+
+### Key Sequences
+
+Send multiple keys in order with optional delay between them:
+
+```bash
+# Emacs-style chords
+pilotty key "Ctrl+X Ctrl+S"       # Save in Emacs
+pilotty key "Ctrl+X m"            # Compose mail in Emacs
+
+# vim command sequences
+pilotty key "Escape : w q Enter"  # Save and quit vim
+pilotty key "g g d G"             # Delete entire file in vim
+
+# With inter-key delay (useful for slow TUIs)
+pilotty key "Tab Tab Enter" --delay 100   # Navigate with 100ms between keys
+```
+
+The `--delay` flag specifies milliseconds between keys (max 10000ms, default 0).
 
 ## Contributing
 

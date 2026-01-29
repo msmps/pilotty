@@ -51,7 +51,7 @@ Examples:
     )]
     Type(TypeArgs),
 
-    /// Send a key or key combination
+    /// Send a key, key combination, or key sequence
     #[command(after_long_help = "\
 Supported Keys:
   Navigation:  Enter, Tab, Escape, Backspace, Space, Delete, Insert
@@ -59,12 +59,18 @@ Supported Keys:
   Function:    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
   Modifiers:   Ctrl+<key>, Alt+<key>
 
+Key Sequences:
+  Space-separated keys are sent in order. Useful for chords like Emacs C-x m.
+
 Examples:
   pilotty key Enter                     # Press enter
   pilotty key Ctrl+C                    # Send interrupt signal
   pilotty key Alt+F                     # Alt+F (often opens File menu)
-  pilotty key F1                        # Open help in many TUIs
-  pilotty key -s editor Escape          # Send Escape to specific session")]
+  pilotty key \"Ctrl+X m\"                # Emacs chord: Ctrl+X then m
+  pilotty key \"Escape : w q Enter\"      # vim :wq sequence
+  pilotty key \"Ctrl+X Ctrl+S\"           # Emacs save (two combos)
+  pilotty key -s editor Escape          # Send Escape to specific session
+  pilotty key \"a b c\" --delay 50        # Send a, b, c with 50ms delay between")]
     Key(KeyArgs),
 
     /// Click at a specific row and column coordinate
@@ -164,8 +170,12 @@ pub struct TypeArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct KeyArgs {
-    /// Key or combo to send (e.g., Enter, Ctrl+C, Alt+F)
+    /// Key, combo, or sequence to send (e.g., Enter, Ctrl+C, "Ctrl+X m")
     pub key: String,
+
+    /// Delay between keys in a sequence (milliseconds, max 10000)
+    #[arg(long, default_value_t = 0)]
+    pub delay: u32,
 
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,

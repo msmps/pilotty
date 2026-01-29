@@ -39,9 +39,15 @@ pub enum Command {
         text: String,
         session: Option<String>,
     },
-    /// Send a key or key combo.
+    /// Send a key, key combo, or key sequence.
+    ///
+    /// For sequences (space-separated keys like "Ctrl+X m"), `delay_ms` specifies
+    /// the delay between each key. Defaults to 0 (no delay). Maximum is 10000ms.
     Key {
         key: String,
+        /// Delay between keys in a sequence (milliseconds). Defaults to 0, max 10000.
+        #[serde(default)]
+        delay_ms: u32,
         session: Option<String>,
     },
     /// Click at a specific row/column coordinate.

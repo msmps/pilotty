@@ -63,6 +63,7 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         }),
         Commands::Key(args) => Some(Command::Key {
             key: args.key.clone(),
+            delay_ms: args.delay,
             session: args.session.clone(),
         }),
         Commands::Click(args) => Some(Command::Click {

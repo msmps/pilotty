@@ -47,6 +47,10 @@ pilotty type "hello world"
 pilotty key Enter
 pilotty key Ctrl+C
 
+# Send key sequences (space-separated)
+pilotty key "Ctrl+X m"            # Emacs chord
+pilotty key "Escape : w q Enter"  # vim :wq
+
 # Click at specific coordinates (row, col)
 pilotty click 10 5
 
