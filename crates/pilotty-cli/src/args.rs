@@ -132,8 +132,7 @@ pub struct SpawnArgs {
     #[arg(short, long)]
     pub name: Option<String>,
 
-    /// Working directory for the spawned process.
-    /// If omitted, inherits the daemon's current directory.
+    /// Working directory for the spawned process [default: current directory]
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
 }

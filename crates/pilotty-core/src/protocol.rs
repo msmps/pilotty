@@ -27,9 +27,9 @@ pub enum Command {
         session_name: Option<String>,
         /// Working directory for the spawned process.
         ///
-        /// If provided, the command runs in this directory. The path must be
-        /// an existing directory. If not provided, the process inherits the
-        /// daemon's working directory.
+        /// The CLI defaults this to the client's current directory. The path
+        /// must be an existing directory. If not provided by the client, the
+        /// process inherits the daemon's working directory.
         cwd: Option<String>,
     },
     /// Kill a session.
