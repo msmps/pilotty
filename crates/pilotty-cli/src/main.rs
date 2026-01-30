@@ -44,7 +44,12 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         Commands::Spawn(args) => Some(Command::Spawn {
             command: args.command.clone(),
             session_name: args.name.clone(),
-            cwd: args.cwd.clone(),
+            // Default to client's cwd if --cwd not explicitly provided
+            cwd: args.cwd.clone().or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
         }),
         Commands::Kill(args) => Some(Command::Kill {
             session: args.session.clone(),
