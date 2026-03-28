@@ -81,6 +81,12 @@ Windows support currently uses ConPTY-backed sessions plus a loopback TCP transp
 # Spawn a TUI application
 pilotty spawn htop
 
+# Run via your configured/default shell
+pilotty spawn --shell opencode
+
+# Force a specific shell (useful on Windows for Git Bash vs PowerShell)
+pilotty spawn --shell --shell-program bash 'echo from bash'
+
 # Take a snapshot of the terminal
 pilotty snapshot
 
@@ -382,6 +388,17 @@ pilotty stores its endpoint marker at (in priority order):
 4. `/tmp/pilotty/{session}.sock` (last resort)
 
 On Unix this path is the Unix domain socket itself. On Windows it is a marker file that stores the daemon's loopback TCP address, allowing reconnects even if the preferred deterministic port was occupied and pilotty had to fall back to another one.
+
+### Shell selection for `spawn --shell`
+
+When `--shell` is used, pilotty resolves the shell in this order:
+1. `--shell-program`
+2. `PILOTTY_SHELL`
+3. `SHELL`
+4. `COMSPEC` (Windows)
+5. platform fallback
+
+Direct `pilotty spawn <command>` still bypasses the shell entirely and execs the command directly.
 
 ## Error Handling
 

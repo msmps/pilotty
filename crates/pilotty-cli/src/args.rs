@@ -25,7 +25,9 @@ Examples:
   pilotty spawn vim file.txt            # Command with arguments
   pilotty spawn --name editor vim       # Named session for easy reference
   pilotty spawn --cwd /tmp bash         # Start bash in /tmp directory
-  pilotty spawn bash -c 'echo hello'    # Shell command with args")]
+  pilotty spawn bash -c 'echo hello'    # Direct shell command with args
+  pilotty spawn --shell opencode        # Run via configured/default shell
+  pilotty spawn --shell --shell-program bash 'echo $SHELL'  # Force a shell")]
     Spawn(SpawnArgs),
 
     /// Kill a session and its child process
@@ -135,6 +137,21 @@ pub struct SpawnArgs {
     /// Working directory for the spawned process [default: current directory]
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
+
+    /// Run the command through a shell instead of direct exec.
+    ///
+    /// Shell resolution order:
+    /// 1. --shell-program
+    /// 2. PILOTTY_SHELL
+    /// 3. SHELL
+    /// 4. COMSPEC (Windows)
+    /// 5. platform fallback
+    #[arg(long)]
+    pub shell: bool,
+
+    /// Explicit shell program for --shell (e.g. bash, pwsh, powershell.exe, cmd.exe)
+    #[arg(long, value_name = "PROGRAM")]
+    pub shell_program: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
