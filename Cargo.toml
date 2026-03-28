@@ -39,3 +39,4 @@ unicode-width = "0.2"
 # System
 libc = "0.2"
 dirs = "5"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

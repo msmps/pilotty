@@ -27,3 +27,4 @@ chrono = { workspace = true }
 vt100 = { workspace = true }
 regex = { workspace = true }
 dirs = { workspace = true }
+windows-sys = { workspace = true }

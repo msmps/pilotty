@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use pilotty_core::protocol::{Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tracing::{debug, info};
 
-use crate::daemon::paths;
+use crate::daemon::{paths, transport};
 
 /// Maximum time to wait for daemon to start up.
 const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,7 +20,7 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Client for communicating with the daemon.
 pub struct DaemonClient {
-    stream: UnixStream,
+    stream: transport::Stream,
 }
 
 impl DaemonClient {
@@ -30,7 +29,7 @@ impl DaemonClient {
         let socket_path = paths::get_socket_path(None);
 
         // Try to connect directly first
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
+        if let Ok(stream) = transport::connect(&socket_path).await {
             debug!("Connected to existing daemon");
             return Ok(Self { stream });
         }
@@ -48,23 +47,36 @@ impl DaemonClient {
     ///
     /// Returns the child process handle so we can detect early crashes.
     fn start_daemon() -> Result<std::process::Child> {
-        use std::os::unix::process::CommandExt;
-
         let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
-        // Spawn daemon as detached background process.
-        // process_group(0) creates a new process group with the child as leader,
-        // preventing the daemon from receiving SIGHUP when the CLI's terminal closes.
-        let child = std::process::Command::new(exe)
+        // Spawn daemon as a background process.
+        // Unix starts it in a new process group to avoid SIGHUP on parent exit.
+        // Windows starts it in a detached process group without opening a new console.
+        let mut command = std::process::Command::new(exe);
+        command
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .context("Failed to spawn daemon process")?;
+            .stderr(Stdio::null());
 
-        Ok(child)
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+        }
+
+        command
+            .spawn()
+            .context("Failed to spawn daemon process")
     }
 
     /// Wait for the daemon socket to become available.
@@ -74,7 +86,7 @@ impl DaemonClient {
     async fn wait_for_daemon(
         socket_path: &PathBuf,
         mut child: std::process::Child,
-    ) -> Result<UnixStream> {
+    ) -> Result<transport::Stream> {
         let start = std::time::Instant::now();
 
         loop {
@@ -95,7 +107,7 @@ impl DaemonClient {
                 }
             }
 
-            match UnixStream::connect(socket_path).await {
+            match transport::connect(socket_path).await {
                 Ok(stream) => {
                     info!("Connected to daemon after {:?}", start.elapsed());
                     return Ok(stream);
@@ -159,7 +171,7 @@ impl DaemonClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use crate::daemon::server::DaemonServer;
@@ -185,7 +197,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connect client directly (bypassing auto-start since we're using temp socket)
-        let stream = UnixStream::connect(&socket_path)
+        let stream = crate::daemon::transport::connect(&socket_path)
             .await
             .expect("Failed to connect");
         let mut client = DaemonClient { stream };

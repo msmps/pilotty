@@ -50,6 +50,8 @@ pilotty enables AI agents to interact with terminal applications through a simpl
 npm install -g pilotty
 ```
 
+This installs the platform-specific native binary for macOS, Linux, or Windows.
+
 ### From Source
 
 ```bash
@@ -69,9 +71,9 @@ Requires [Rust](https://rustup.rs) 1.70+.
 | macOS | arm64 (Apple Silicon) | ✅ |
 | Linux | x64 | ✅ |
 | Linux | arm64 | ✅ |
-| Windows | - | ❌ Not supported |
+| Windows | x64 | ✅ Experimental |
 
-Windows is not supported due to the use of Unix domain sockets and POSIX PTY APIs.
+Windows support currently uses pipe-backed sessions plus a loopback TCP transport for daemon communication. It works for shell-oriented automation and command output, but full-screen TUIs should still be treated as experimental.
 
 ## Quick Start
 
@@ -340,7 +342,7 @@ pilotty spawn --name editor vim
 pilotty uses a daemon architecture similar to agent-browser:
 
 ```
-┌─────────────┐     Unix Socket      ┌─────────────────┐
+┌─────────────┐   Local transport    ┌─────────────────┐
 │   CLI       │ ──────────────────▶  │     Daemon      │
 │  (pilotty)  │     JSON-line        │  (auto-started) │
 └─────────────┘                      └─────────────────┘
@@ -371,13 +373,15 @@ The daemon is designed for zero-maintenance operation:
 
 This means you never need to manually manage the daemon, it starts when needed and stops when idle.
 
-### Socket Location
+### Transport Location
 
-The daemon socket is created at (in priority order):
+pilotty stores its endpoint marker at (in priority order):
 1. `$PILOTTY_SOCKET_DIR/{session}.sock` (explicit override)
 2. `$XDG_RUNTIME_DIR/pilotty/{session}.sock` (Linux standard)
 3. `~/.pilotty/{session}.sock` (home directory fallback)
 4. `/tmp/pilotty/{session}.sock` (last resort)
+
+On Unix this path is the Unix domain socket itself. On Windows it is a marker file used to derive the loopback TCP port.
 
 ## Error Handling
 

@@ -22,14 +22,15 @@
     "url": "https://github.com/msmps/pilotty/issues"
   },
   "bin": {
-    "pilotty": "./bin/pilotty"
+    "pilotty": "./bin/pilotty.js"
   },
   "files": [
     "bin"
   ],
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "cpu": [
     "x64",

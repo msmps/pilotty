@@ -183,7 +183,7 @@ fn run_daemon() {
                     std::process::exit(1);
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = ctrl_c_signal() => {
                 info!("Received SIGINT, shutting down gracefully");
             }
             _ = sigterm() => {
@@ -192,6 +192,24 @@ fn run_daemon() {
         }
         // Server is dropped here, triggering cleanup of socket and PID files
     });
+}
+
+/// Wait for SIGINT / Ctrl+C.
+///
+/// On Windows the auto-started daemon runs detached without a console, so listening
+/// for Ctrl+C can cause premature shutdown. Detached daemons are stopped via the
+/// explicit `pilotty stop` command instead.
+#[cfg(unix)]
+async fn ctrl_c_signal() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!("Failed to register SIGINT handler: {}", e);
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(windows)]
+async fn ctrl_c_signal() {
+    std::future::pending::<()>().await;
 }
 
 /// Wait for SIGTERM signal (Unix only).

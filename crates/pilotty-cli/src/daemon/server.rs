@@ -1,4 +1,4 @@
-//! Unix socket server for the daemon process.
+//! Cross-platform daemon server transport.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,11 +10,11 @@ use pilotty_core::input::encode_mouse_click_combined;
 use pilotty_core::protocol::{Command, Request, Response, ResponseData, SnapshotFormat};
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use crate::daemon::transport;
 use crate::daemon::paths;
 use crate::daemon::session::{SessionId, SessionManager};
 
@@ -32,7 +32,7 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The daemon server that listens for client connections.
 pub struct DaemonServer {
-    listener: UnixListener,
+    listener: transport::Listener,
     socket_path: PathBuf,
     pid_path: PathBuf,
     sessions: Arc<SessionManager>,
@@ -76,36 +76,35 @@ impl DaemonServer {
         };
 
         // Try to bind directly (avoid TOCTOU race)
-        let listener = match UnixListener::bind(&socket_path) {
+        let listener = match transport::bind(&socket_path).await {
             Ok(l) => {
                 // Write PID immediately after bind to prevent race condition
                 write_pid(&pid_path)?;
                 l
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(e) if transport::is_addr_in_use(&e) => {
                 // Socket exists, check if daemon is still alive
                 if is_daemon_alive(&pid_path) {
                     anyhow::bail!(
-                        "Daemon already running (socket {:?} in use, PID file valid)",
-                        socket_path
+                        "Daemon already running (endpoint {} in use, PID file valid)",
+                        transport::describe_endpoint(&socket_path)
                     );
                 }
 
-                // Daemon is dead, but verify the socket file is safe to remove
-                // Don't follow symlinks (could delete unintended files)
-                let metadata = std::fs::symlink_metadata(&socket_path)
-                    .with_context(|| format!("Failed to stat socket path: {:?}", socket_path))?;
-
-                if metadata.file_type().is_symlink() {
-                    anyhow::bail!(
-                        "Socket path {:?} is a symlink, refusing to delete for safety",
-                        socket_path
-                    );
-                }
-
-                // On Unix, verify it's actually a socket file
                 #[cfg(unix)]
                 {
+                    // Daemon is dead, but verify the socket file is safe to remove.
+                    // Don't follow symlinks (could delete unintended files).
+                    let metadata = std::fs::symlink_metadata(&socket_path)
+                        .with_context(|| format!("Failed to stat socket path: {:?}", socket_path))?;
+
+                    if metadata.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "Socket path {:?} is a symlink, refusing to delete for safety",
+                            socket_path
+                        );
+                    }
+
                     use std::os::unix::fs::FileTypeExt;
                     if !metadata.file_type().is_socket() {
                         anyhow::bail!(
@@ -114,18 +113,27 @@ impl DaemonServer {
                             metadata.file_type()
                         );
                     }
+
+                    info!("Removing stale socket from dead daemon");
+                    std::fs::remove_file(&socket_path).with_context(|| {
+                        format!("Failed to remove stale socket: {:?}", socket_path)
+                    })?;
+
+                    let l = transport::bind(&socket_path)
+                        .await
+                        .with_context(|| format!("Failed to bind to socket: {:?}", socket_path))?;
+                    write_pid(&pid_path)?;
+                    l
                 }
 
-                // Safe to remove stale socket
-                info!("Removing stale socket from dead daemon");
-                std::fs::remove_file(&socket_path)
-                    .with_context(|| format!("Failed to remove stale socket: {:?}", socket_path))?;
-
-                let l = UnixListener::bind(&socket_path)
-                    .with_context(|| format!("Failed to bind to socket: {:?}", socket_path))?;
-                // Write PID immediately after bind to prevent race condition
-                write_pid(&pid_path)?;
-                l
+                #[cfg(windows)]
+                {
+                    anyhow::bail!(
+                        "Daemon endpoint {} is already in use, but the PID file {:?} does not point to a live daemon. Another process may be occupying the TCP port.",
+                        transport::describe_endpoint(&socket_path),
+                        pid_path
+                    );
+                }
             }
             Err(e) => {
                 return Err(e)
@@ -133,7 +141,10 @@ impl DaemonServer {
             }
         };
 
-        info!("Daemon listening on {:?}", socket_path);
+        transport::write_endpoint_marker(&socket_path)
+            .with_context(|| format!("Failed to write endpoint marker: {:?}", socket_path))?;
+
+        info!("Daemon listening on {}", transport::describe_endpoint(&socket_path));
 
         Ok(Self {
             listener,
@@ -368,7 +379,35 @@ fn is_daemon_alive(pid_path: &Path) -> bool {
     // SAFETY: libc::kill with signal 0 is a POSIX-defined no-op that only checks
     // whether the process exists and the caller has permission to signal it.
     // The pid is validated as a valid i32 above. No actual signal is delivered.
-    unsafe { libc::kill(pid, 0) == 0 }
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) checks if process exists without sending a signal.
+        // SAFETY: libc::kill with signal 0 is a POSIX-defined no-op that only checks
+        // whether the process exists and the caller has permission to signal it.
+        // The pid is validated as a valid i32 above. No actual signal is delivered.
+        return unsafe { libc::kill(pid, 0) == 0 };
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        const STILL_ACTIVE: u32 = 259;
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+
+        if handle == std::ptr::null_mut() {
+            return false;
+        }
+
+        let mut exit_code = 0u32;
+        let running = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE };
+        unsafe { CloseHandle(handle) };
+        running
+    }
 }
 
 /// Maximum request size in bytes (1 MB should be plenty for any reasonable request).
@@ -441,7 +480,7 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
 
 /// Handle a single client connection.
 async fn handle_connection(
-    stream: UnixStream,
+    stream: transport::Stream,
     sessions: Arc<SessionManager>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -1304,7 +1343,7 @@ async fn handle_shutdown(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use pilotty_core::error::ErrorCode;
