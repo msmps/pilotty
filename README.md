@@ -73,7 +73,7 @@ Requires [Rust](https://rustup.rs) 1.70+.
 | Linux | arm64 | ✅ |
 | Windows | x64 | ✅ Experimental |
 
-Windows support currently uses pipe-backed sessions plus a loopback TCP transport for daemon communication. It works for shell-oriented automation and command output, but full-screen TUIs should still be treated as experimental.
+Windows support currently uses ConPTY-backed sessions plus a loopback TCP transport for daemon communication. Basic interactive text applications now work substantially better, including cursor-position query/response flows that many modern TUIs rely on. Full-screen TUIs should still be treated as experimental.
 
 ## Quick Start
 
@@ -381,7 +381,7 @@ pilotty stores its endpoint marker at (in priority order):
 3. `~/.pilotty/{session}.sock` (home directory fallback)
 4. `/tmp/pilotty/{session}.sock` (last resort)
 
-On Unix this path is the Unix domain socket itself. On Windows it is a marker file used to derive the loopback TCP port.
+On Unix this path is the Unix domain socket itself. On Windows it is a marker file that stores the daemon's loopback TCP address, allowing reconnects even if the preferred deterministic port was occupied and pilotty had to fall back to another one.
 
 ## Error Handling
 

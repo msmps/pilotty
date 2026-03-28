@@ -128,11 +128,17 @@ impl DaemonServer {
 
                 #[cfg(windows)]
                 {
-                    anyhow::bail!(
-                        "Daemon endpoint {} is already in use, but the PID file {:?} does not point to a live daemon. Another process may be occupying the TCP port.",
+                    info!(
+                        "Preferred daemon endpoint {} is occupied and PID file {:?} is stale; falling back to another loopback port",
                         transport::describe_endpoint(&socket_path),
                         pid_path
                     );
+
+                    let l = transport::bind_fallback(&socket_path)
+                        .await
+                        .with_context(|| format!("Failed to bind fallback endpoint for {:?}", socket_path))?;
+                    write_pid(&pid_path)?;
+                    l
                 }
             }
             Err(e) => {
@@ -141,10 +147,10 @@ impl DaemonServer {
             }
         };
 
-        transport::write_endpoint_marker(&socket_path)
+        transport::write_endpoint_marker(&socket_path, &listener)
             .with_context(|| format!("Failed to write endpoint marker: {:?}", socket_path))?;
 
-        info!("Daemon listening on {}", transport::describe_endpoint(&socket_path));
+        info!("Daemon listening on {}", transport::describe_listener(&listener));
 
         Ok(Self {
             listener,

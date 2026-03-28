@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use pilotty_core::protocol::{Request, Response};
+use pilotty_core::protocol::{Command, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -18,6 +18,9 @@ const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Interval between socket connection attempts.
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Timeout for validating an already-running daemon.
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Client for communicating with the daemon.
 pub struct DaemonClient {
     stream: transport::Stream,
@@ -28,10 +31,16 @@ impl DaemonClient {
     pub async fn connect() -> Result<Self> {
         let socket_path = paths::get_socket_path(None);
 
-        // Try to connect directly first
+        // Try to connect directly first. On Windows the preferred loopback port may
+        // be occupied by some unrelated process, so we validate the endpoint before
+        // trusting it as a live pilotty daemon.
         if let Ok(stream) = transport::connect(&socket_path).await {
-            debug!("Connected to existing daemon");
-            return Ok(Self { stream });
+            let mut client = Self { stream };
+            if client.probe().await {
+                debug!("Connected to existing daemon");
+                return Ok(client);
+            }
+            debug!("Endpoint accepted a connection but did not behave like pilotty; starting a new daemon");
         }
 
         // Daemon not running, start it
@@ -109,8 +118,14 @@ impl DaemonClient {
 
             match transport::connect(socket_path).await {
                 Ok(stream) => {
-                    info!("Connected to daemon after {:?}", start.elapsed());
-                    return Ok(stream);
+                    let mut client = Self { stream };
+                    if client.probe().await {
+                        info!("Connected to daemon after {:?}", start.elapsed());
+                        return Ok(client.stream);
+                    }
+                    debug!(
+                        "Connected endpoint during startup, but it did not behave like pilotty yet"
+                    );
                 }
                 Err(_) => {
                     if start.elapsed() > DAEMON_STARTUP_TIMEOUT {
@@ -120,6 +135,18 @@ impl DaemonClient {
                 }
             }
         }
+    }
+
+    async fn probe(&mut self) -> bool {
+        let request = Request {
+            id: "probe".to_string(),
+            command: Command::ListSessions,
+        };
+
+        self.request_with_timeout(request, DAEMON_PROBE_TIMEOUT)
+            .await
+            .map(|response| response.success)
+            .unwrap_or(false)
     }
 
     /// Send a request and wait for a response.

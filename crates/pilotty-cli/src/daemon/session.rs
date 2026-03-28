@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use pilotty_core::elements::classify::{detect, ClassifyContext};
 use pilotty_core::elements::Element;
@@ -79,7 +79,7 @@ pub struct Session {
     /// Terminal size.
     pub size: TermSize,
     /// Async handle for PTY I/O.
-    pub pty: AsyncPtyHandle,
+    pub pty: Arc<AsyncPtyHandle>,
     /// Terminal emulator tracking screen state.
     /// Wrapped in Mutex for interior mutability (fed by PTY reader task).
     pub terminal: Arc<Mutex<TerminalEmulator>>,
@@ -106,71 +106,81 @@ impl Session {
         self.pty.write(data).await
     }
 
-    /// Drain pending PTY output and feed to terminal emulator.
-    ///
-    /// Call this before taking a snapshot to ensure screen state is current.
-    ///
-    /// To prevent blocking on noisy processes, this has limits:
-    /// - Maximum 100 iterations (reads)
-    /// - Maximum 1MB total data
-    /// - 10ms timeout per read
-    ///
-    /// These limits ensure the drain completes quickly even with high-output processes.
-    pub async fn drain_pty_output(&self) {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        // Limits to prevent blocking on noisy processes
-        const MAX_ITERATIONS: usize = 100;
-        const MAX_BYTES: usize = 1024 * 1024; // 1 MB
-
-        let mut terminal = self.terminal.lock().await;
-        let mut iterations = 0;
-        let mut total_bytes = 0;
-
-        // Read available data from PTY (non-blocking via short timeout)
-        loop {
-            if iterations >= MAX_ITERATIONS {
-                debug!(
-                    "Drain hit iteration limit ({} iterations, {} bytes)",
-                    iterations, total_bytes
-                );
-                break;
-            }
-
-            match timeout(Duration::from_millis(10), self.pty.read()).await {
-                Ok(Some(data)) => {
-                    let len = data.len();
-                    debug!("Fed {} bytes to terminal emulator", len);
-                    terminal.feed(&data);
-
-                    iterations += 1;
-                    total_bytes += len;
-
-                    if total_bytes >= MAX_BYTES {
-                        debug!(
-                            "Drain hit byte limit ({} iterations, {} bytes)",
-                            iterations, total_bytes
-                        );
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // PTY closed
-                    debug!("PTY channel closed");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - no more data available
-                    break;
-                }
-            }
-        }
-    }
 }
 
 /// Maximum number of concurrent sessions to prevent resource exhaustion.
 const MAX_SESSIONS: usize = 100;
+
+fn spawn_output_pump(
+    session_id: SessionId,
+    pty: Arc<AsyncPtyHandle>,
+    terminal: Arc<Mutex<TerminalEmulator>>,
+) {
+    tokio::spawn(async move {
+        while let Some(data) = pty.read().await {
+            debug!(
+                "PTY output pump read {} bytes from session {}",
+                data.len(), session_id
+            );
+            let responses = {
+                let mut terminal = terminal.lock().await;
+                feed_terminal_and_collect_responses(&mut terminal, &data)
+            };
+
+            for response in responses {
+                if let Err(e) = pty.write(&response).await {
+                    warn!(
+                        "Failed to send terminal response back to session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            }
+        }
+
+        debug!("PTY output pump ended for session {}", session_id);
+    });
+}
+
+fn feed_terminal_and_collect_responses(
+    terminal: &mut TerminalEmulator,
+    data: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut responses = Vec::new();
+    let mut segment_start = 0usize;
+    let mut i = 0usize;
+
+    while i < data.len() {
+        let response = if data[i..].starts_with(b"\x1b[6n") {
+            let (row, col) = terminal.cursor_position();
+            Some((4usize, format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()))
+        } else if data[i..].starts_with(b"\x1b[?6n") {
+            let (row, col) = terminal.cursor_position();
+            Some((5usize, format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes()))
+        } else {
+            None
+        };
+
+        if let Some((query_len, response)) = response {
+            if segment_start < i {
+                terminal.feed(&data[segment_start..i]);
+            }
+            debug!("Responding to terminal query with {:?}", String::from_utf8_lossy(&response));
+            responses.push(response);
+            i += query_len;
+            segment_start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if segment_start < data.len() {
+        terminal.feed(&data[segment_start..]);
+    }
+
+    responses
+}
 
 /// Manages active PTY sessions.
 ///
@@ -242,13 +252,17 @@ impl SessionManager {
             .map_err(|e| ApiError::spawn_failed(&command, &e.to_string()))?;
 
         // Wrap in async handle
-        let pty = AsyncPtyHandle::new(pty_session)
-            .map_err(|e| ApiError::spawn_failed(&command, &e.to_string()))?;
+        let pty = Arc::new(
+            AsyncPtyHandle::new(pty_session)
+                .map_err(|e| ApiError::spawn_failed(&command, &e.to_string()))?,
+        );
 
         // Create terminal emulator to track screen state
         let terminal = Arc::new(Mutex::new(TerminalEmulator::new(size)));
 
         let id = SessionId::new();
+        spawn_output_pump(id.clone(), pty.clone(), terminal.clone());
+
         let session = Session {
             id: id.clone(),
             name,
@@ -388,9 +402,7 @@ impl SessionManager {
             .get(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
 
-        // Drain pending PTY output to update terminal state
-        session.drain_pty_output().await;
-
+        // Output is pumped into the terminal emulator continuously.
         // Lock terminal once for all reads
         let terminal = session.terminal.lock().await;
 
@@ -484,8 +496,6 @@ impl SessionManager {
             .get(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
 
-        // Drain to get current terminal state
-        session.drain_pty_output().await;
         Ok(session.application_cursor().await)
     }
 

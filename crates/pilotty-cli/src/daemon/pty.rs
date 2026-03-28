@@ -1,14 +1,12 @@
-//! PTY / process session management.
+//! PTY session management using portable-pty.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
-
-#[cfg(unix)]
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 /// Terminal size in columns and rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +21,6 @@ impl Default for TermSize {
     }
 }
 
-#[cfg(unix)]
 impl From<TermSize> for PtySize {
     fn from(size: TermSize) -> Self {
         PtySize {
@@ -35,206 +32,119 @@ impl From<TermSize> for PtySize {
     }
 }
 
-/// A spawned terminal/process session.
+/// A PTY session wrapping a master PTY and child process.
 pub struct PtySession {
-    size: TermSize,
-    #[cfg(unix)]
     master: Box<dyn MasterPty + Send>,
-    #[cfg(unix)]
     child: Box<dyn Child + Send + Sync>,
-    #[cfg(windows)]
-    reader: Option<Box<dyn Read + Send>>,
-    #[cfg(windows)]
-    writer: Option<Box<dyn Write + Send>>,
-    #[cfg(windows)]
-    child: std::process::Child,
+    size: TermSize,
 }
 
 impl PtySession {
-    /// Spawn a command in a new PTY/session.
+    /// Spawn a command in a new PTY session.
+    ///
+    /// If `cwd` is provided, the command will run in that directory.
+    /// Otherwise, it inherits the daemon's current directory.
     pub fn spawn(command: &[String], size: TermSize, cwd: Option<&str>) -> Result<Self> {
         if command.is_empty() {
             anyhow::bail!("Command cannot be empty");
         }
 
-        #[cfg(unix)]
-        {
-            let pty_system = native_pty_system();
-            let pair = pty_system
-                .openpty(size.into())
-                .context("Failed to open PTY")?;
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(size.into())
+            .context("Failed to open PTY")?;
 
-            let mut cmd = CommandBuilder::new(&command[0]);
-            if command.len() > 1 {
-                cmd.args(&command[1..]);
-            }
-            if let Some(dir) = cwd {
-                cmd.cwd(dir);
-            }
-
-            let child = pair
-                .slave
-                .spawn_command(cmd)
-                .context("Failed to spawn command")?;
-
-            return Ok(Self {
-                size,
-                master: pair.master,
-                child,
-            });
+        let mut cmd = CommandBuilder::new(&command[0]);
+        if command.len() > 1 {
+            cmd.args(&command[1..]);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
         }
 
-        #[cfg(windows)]
-        {
-            let mut cmd = std::process::Command::new(&command[0]);
-            if command.len() > 1 {
-                cmd.args(&command[1..]);
-            }
-            if let Some(dir) = cwd {
-                cmd.current_dir(dir);
-            }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("Failed to spawn command")?;
 
-            cmd.stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null());
-
-            let mut child = cmd.spawn().context("Failed to spawn command")?;
-            let reader = child
-                .stdout
-                .take()
-                .context("Failed to capture process stdout")?;
-            let writer = child
-                .stdin
-                .take()
-                .context("Failed to capture process stdin")?;
-
-            return Ok(Self {
-                size,
-                reader: Some(Box::new(reader)),
-                writer: Some(Box::new(writer)),
-                child,
-            });
-        }
+        Ok(Self {
+            master: pair.master,
+            child,
+            size,
+        })
     }
 
-    #[cfg(unix)]
+    /// Get a reader for the PTY output.
     pub fn reader(&self) -> Result<Box<dyn Read + Send>> {
         self.master
             .try_clone_reader()
             .context("Failed to clone PTY reader")
     }
 
-    #[cfg(unix)]
+    /// Get a writer for the PTY input.
     pub fn writer(&self) -> Result<Box<dyn Write + Send>> {
         self.master
             .take_writer()
             .context("Failed to take PTY writer")
     }
 
-    #[cfg(windows)]
-    fn take_reader(&mut self) -> Result<Box<dyn Read + Send>> {
-        self.reader
-            .take()
-            .context("Process reader already taken")
-    }
-
-    #[cfg(windows)]
-    fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
-        self.writer
-            .take()
-            .context("Process writer already taken")
-    }
-
+    /// Get the current terminal size.
     pub fn size(&self) -> TermSize {
         self.size
     }
 
-    #[cfg(unix)]
-    pub fn into_parts(self) -> (Box<dyn MasterPty + Send>, ManagedChild) {
-        (self.master, ManagedChild::Portable(self.child))
-    }
-
-    #[cfg(windows)]
-    fn into_child(self) -> ManagedChild {
-        ManagedChild::Std(self.child)
+    /// Consume the session and return the master PTY and child process.
+    ///
+    /// Used by AsyncPtyHandle to keep the master for resize operations
+    /// and the child for proper process cleanup on shutdown.
+    pub fn into_parts(self) -> (Box<dyn MasterPty + Send>, Box<dyn Child + Send + Sync>) {
+        (self.master, self.child)
     }
 }
 
-enum ManagedChild {
-    #[cfg(unix)]
-    Portable(Box<dyn Child + Send + Sync>),
-    #[cfg(windows)]
-    Std(std::process::Child),
-}
-
-impl ManagedChild {
-    fn kill(&mut self) -> Result<()> {
-        match self {
-            #[cfg(unix)]
-            Self::Portable(child) => child.kill().context("Failed to kill PTY child"),
-            #[cfg(windows)]
-            Self::Std(child) => child.kill().context("Failed to kill process child"),
-        }
-    }
-
-    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        match self {
-            #[cfg(unix)]
-            Self::Portable(child) => child.try_wait().context("Failed to poll PTY child"),
-            #[cfg(windows)]
-            Self::Std(child) => child.try_wait().context("Failed to poll process child"),
-        }
-    }
-}
-
-/// Buffer size for reading from PTY/process stdout.
+/// Buffer size for reading from PTY.
 const READ_BUFFER_SIZE: usize = 4096;
 
-/// Handle for async terminal/process I/O operations.
+/// Handle for async PTY I/O operations.
+///
+/// Uses tokio channels for async I/O with background threads for the
+/// actual blocking PTY reads/writes.
 pub struct AsyncPtyHandle {
+    /// Sender for writing to PTY stdin.
     write_tx: mpsc::Sender<Vec<u8>>,
+    /// Receiver for reading from PTY stdout.
+    /// Wrapped in Mutex for interior mutability so read() can take &self,
+    /// avoiding the need for &mut self which would require exclusive session access.
     read_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Flag to signal shutdown.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(unix)]
+    /// Master PTY for resize operations (sends SIGWINCH).
+    /// Wrapped in Mutex to make AsyncPtyHandle Sync.
     master: std::sync::Mutex<Box<dyn MasterPty + Send>>,
-    child: std::sync::Mutex<ManagedChild>,
+    /// Child process handle for cleanup on shutdown.
+    /// Wrapped in Mutex to allow killing from shutdown().
+    child: std::sync::Mutex<Box<dyn Child + Send + Sync>>,
+    /// Current terminal size, updated on resize.
+    /// Wrapped in Mutex for interior mutability.
     size: std::sync::Mutex<TermSize>,
+    /// Handle to the reader thread for cleanup.
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// Handle to the writer thread for cleanup.
     writer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncPtyHandle {
-    /// Create async I/O channels for a PTY/process session.
+    /// Create async I/O channels for a PTY session.
+    ///
+    /// This spawns background threads for reading and writing to the PTY.
     pub fn new(session: PtySession) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            let reader = session.reader()?;
-            let writer = session.writer()?;
-            let initial_size = session.size();
-            let (master, child) = session.into_parts();
-            return Self::new_inner(reader, writer, initial_size, Some(master), child);
-        }
+        let reader = session.reader()?;
+        let writer = session.writer()?;
+        let initial_size = session.size();
+        let (master, child) = session.into_parts();
 
-        #[cfg(windows)]
-        {
-            let mut session = session;
-            let reader = session.take_reader()?;
-            let writer = session.take_writer()?;
-            let initial_size = session.size();
-            let child = session.into_child();
-            return Self::new_inner(reader, writer, initial_size, child);
-        }
-    }
-
-    #[cfg(unix)]
-    fn new_inner(
-        reader: Box<dyn Read + Send>,
-        writer: Box<dyn Write + Send>,
-        initial_size: TermSize,
-        master: Option<Box<dyn MasterPty + Send>>,
-        child: ManagedChild,
-    ) -> Result<Self> {
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
         let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(64);
 
@@ -251,7 +161,7 @@ impl AsyncPtyHandle {
             write_tx,
             read_rx: tokio::sync::Mutex::new(read_rx),
             shutdown,
-            master: std::sync::Mutex::new(master.context("Missing PTY master")?),
+            master: std::sync::Mutex::new(master),
             child: std::sync::Mutex::new(child),
             size: std::sync::Mutex::new(initial_size),
             reader_thread: Some(reader_thread),
@@ -259,47 +169,13 @@ impl AsyncPtyHandle {
         })
     }
 
-    #[cfg(windows)]
-    fn new_inner(
-        reader: Box<dyn Read + Send>,
-        writer: Box<dyn Write + Send>,
-        initial_size: TermSize,
-        child: ManagedChild,
-    ) -> Result<Self> {
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(64);
-
-        let reader_shutdown = shutdown.clone();
-        let reader_thread = std::thread::spawn(move || {
-            Self::reader_loop(reader, read_tx, reader_shutdown);
-        });
-
-        let writer_thread = std::thread::spawn(move || {
-            Self::writer_loop(writer, write_rx);
-        });
-
-        Ok(Self {
-            write_tx,
-            read_rx: tokio::sync::Mutex::new(read_rx),
-            shutdown,
-            child: std::sync::Mutex::new(child),
-            size: std::sync::Mutex::new(initial_size),
-            reader_thread: Some(reader_thread),
-            writer_thread: Some(writer_thread),
-        })
-    }
-
-    /// Resize the PTY. On Windows pipe-backed sessions this is currently a no-op.
+    /// Resize the PTY and send SIGWINCH / equivalent to the child process.
     pub fn resize(&self, size: TermSize) -> Result<()> {
-        #[cfg(unix)]
-        {
-            self.master
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Master PTY mutex poisoned"))?
-                .resize(size.into())
-                .context("Failed to resize PTY")?;
-        }
+        self.master
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Master PTY mutex poisoned"))?
+            .resize(size.into())
+            .context("Failed to resize PTY")?;
 
         *self
             .size
@@ -308,20 +184,25 @@ impl AsyncPtyHandle {
         Ok(())
     }
 
-    /// Send bytes to stdin.
+    /// Send bytes to the PTY stdin.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         self.write_tx
             .send(data.to_vec())
             .await
-            .context("Failed to send to input channel")
+            .context("Failed to send to PTY input channel")
     }
 
-    /// Receive bytes from stdout.
+    /// Receive bytes from the PTY stdout.
+    ///
+    /// Returns None if the PTY has closed.
     pub async fn read(&self) -> Option<Vec<u8>> {
         self.read_rx.lock().await.recv().await
     }
 
-    /// Check whether the child has exited.
+    /// Check if the child process has exited without blocking.
+    ///
+    /// Returns `Some(true)` if the process has exited, `Some(false)` if still running,
+    /// or `None` if the mutex is poisoned.
     pub fn has_exited(&self) -> Option<bool> {
         self.child
             .lock()
@@ -330,11 +211,14 @@ impl AsyncPtyHandle {
             .map(|status| status.is_some())
     }
 
-    /// Shutdown async I/O and terminate the child process.
+    /// Shutdown the async PTY I/O and terminate the child process.
     pub async fn shutdown(&self) {
         if let Ok(mut child) = self.child.lock() {
             if let Err(e) = child.kill() {
-                debug!("Failed to kill child process (may have already exited): {}", e);
+                debug!(
+                    "Failed to kill child process (may have already exited): {}",
+                    e
+                );
             }
             if let Err(e) = child.try_wait() {
                 debug!("Failed to collect child exit status: {}", e);
@@ -346,6 +230,7 @@ impl AsyncPtyHandle {
         self.read_rx.lock().await.close();
     }
 
+    /// Reader loop running in a background thread.
     fn reader_loop(
         mut reader: Box<dyn Read + Send>,
         read_tx: mpsc::Sender<Vec<u8>>,
@@ -381,6 +266,7 @@ impl AsyncPtyHandle {
         }
     }
 
+    /// Writer loop running in a background thread.
     fn writer_loop(mut writer: Box<dyn Write + Send>, mut write_rx: mpsc::Receiver<Vec<u8>>) {
         while let Some(data) = write_rx.blocking_recv() {
             if let Err(e) = writer.write_all(&data) {
@@ -400,7 +286,10 @@ impl Drop for AsyncPtyHandle {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             if let Err(e) = child.kill() {
-                debug!("Failed to kill child on drop (may have already exited): {}", e);
+                debug!(
+                    "Failed to kill child on drop (may have already exited): {}",
+                    e
+                );
             }
             if let Err(e) = child.try_wait() {
                 debug!("Failed to collect child exit status on drop: {}", e);
@@ -412,12 +301,12 @@ impl Drop for AsyncPtyHandle {
 
         if let Some(ref handle) = self.reader_thread {
             if !handle.is_finished() {
-                debug!("PTY reader thread still running on drop, will terminate on close");
+                debug!("PTY reader thread still running on drop, will terminate on PTY close");
             }
         }
         if let Some(ref handle) = self.writer_thread {
             if !handle.is_finished() {
-                debug!("PTY writer thread still running on drop, will terminate on close");
+                debug!("PTY writer thread still running on drop, will terminate on channel close");
             }
         }
     }
@@ -442,6 +331,7 @@ mod tests {
 
         let mut output = vec![0u8; 1024];
         let mut total_read = 0;
+
         std::thread::sleep(Duration::from_millis(100));
 
         loop {
@@ -482,6 +372,7 @@ mod tests {
 
         writer.write_all(b"test input\n").expect("Failed to write");
         writer.flush().expect("Failed to flush");
+
         std::thread::sleep(Duration::from_millis(100));
 
         let mut output = vec![0u8; 256];
@@ -565,6 +456,7 @@ mod tests {
             .expect("Failed to spawn pwd with cwd");
 
         let mut reader = session.reader().expect("Failed to get reader");
+
         std::thread::sleep(Duration::from_millis(100));
 
         let mut output = vec![0u8; 256];
