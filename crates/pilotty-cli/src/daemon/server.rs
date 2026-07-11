@@ -18,7 +18,10 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::paths;
+use crate::daemon::retention::DEFAULT_RETAIN_BYTES;
 use crate::daemon::session::{ObservationEvent, SessionId, SessionManager};
+
+const RETAIN_BYTES_ENV: &str = "PILOTTY_RETAIN_BYTES";
 
 /// Maximum number of concurrent client connections to prevent resource exhaustion.
 const MAX_CONNECTIONS: usize = 100;
@@ -53,7 +56,8 @@ impl DaemonServer {
         paths::ensure_socket_dir().context("Failed to create socket directory")?;
         let socket_path = paths::get_socket_path(None);
         let pid_path = paths::get_pid_path(None);
-        Self::bind_to(socket_path, pid_path).await
+        let retain_bytes = retain_bytes_from_env()?;
+        Self::bind_to_with_retain_bytes(socket_path, pid_path, retain_bytes).await
     }
 
     /// Create a new daemon server bound to a specific socket path.
@@ -63,7 +67,16 @@ impl DaemonServer {
     /// 2. If socket in use, check PID file to see if daemon is alive
     /// 3. If daemon dead, remove stale socket and retry
     /// 4. If daemon alive, return error
+    #[cfg(test)]
     pub async fn bind_to(socket_path: PathBuf, pid_path: PathBuf) -> Result<Self> {
+        Self::bind_to_with_retain_bytes(socket_path, pid_path, DEFAULT_RETAIN_BYTES).await
+    }
+
+    pub(crate) async fn bind_to_with_retain_bytes(
+        socket_path: PathBuf,
+        pid_path: PathBuf,
+        retain_bytes: usize,
+    ) -> Result<Self> {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create socket directory for {:?}", socket_path)
@@ -142,7 +155,7 @@ impl DaemonServer {
             listener,
             socket_path,
             pid_path,
-            sessions: Arc::new(SessionManager::new()),
+            sessions: Arc::new(SessionManager::with_default_retain_bytes(retain_bytes)),
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             shutdown: Arc::new(Notify::new()),
         })
@@ -314,6 +327,22 @@ impl DaemonServer {
             }
         });
     }
+}
+
+fn retain_bytes_from_env() -> Result<usize> {
+    parse_retain_bytes(std::env::var_os(RETAIN_BYTES_ENV).as_deref())
+}
+
+fn parse_retain_bytes(value: Option<&std::ffi::OsStr>) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_RETAIN_BYTES);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{RETAIN_BYTES_ENV} must contain a non-negative integer"))?;
+    value.parse::<usize>().with_context(|| {
+        format!("{RETAIN_BYTES_ENV} must be a non-negative integer number of bytes, got '{value}'")
+    })
 }
 
 /// Kill all active sessions during shutdown.
@@ -521,7 +550,18 @@ async fn handle_request(
             command,
             session_name,
             cwd,
-        } => handle_spawn(&request_id, &sessions, command, session_name, cwd).await,
+            retain_bytes,
+        } => {
+            handle_spawn(
+                &request_id,
+                &sessions,
+                command,
+                session_name,
+                cwd,
+                retain_bytes,
+            )
+            .await
+        }
 
         Command::Snapshot {
             session,
@@ -543,6 +583,8 @@ async fn handle_request(
         }
 
         Command::ListSessions => handle_list_sessions(&request_id, &sessions).await,
+
+        Command::Logs { session } => handle_logs(&request_id, &sessions, session).await,
 
         Command::Kill { session } => handle_kill(&request_id, &sessions, session).await,
 
@@ -602,6 +644,7 @@ async fn handle_spawn(
     command: Vec<String>,
     session_name: Option<String>,
     cwd: Option<String>,
+    retain_bytes: Option<u64>,
 ) -> Response {
     if command.is_empty() {
         return Response::error(
@@ -636,8 +679,21 @@ async fn handle_spawn(
         }
     }
 
+    let retain_bytes = match retain_bytes.map(usize::try_from).transpose() {
+        Ok(retain_bytes) => retain_bytes,
+        Err(_) => {
+            return Response::error(
+                request_id,
+                ApiError::invalid_input_with_suggestion(
+                    "Retention limit is too large for this daemon",
+                    "Choose a smaller --retain-bytes value.",
+                ),
+            );
+        }
+    };
+
     match sessions
-        .create_session(command.clone(), session_name, None, cwd)
+        .create_session_with_retention(command.clone(), session_name, None, cwd, retain_bytes)
         .await
     {
         Ok(id) => {
@@ -651,6 +707,32 @@ async fn handle_spawn(
             )
         }
         Err(e) => Response::error(request_id, e),
+    }
+}
+
+/// Handle logs command.
+async fn handle_logs(
+    request_id: &str,
+    sessions: &SessionManager,
+    session: Option<String>,
+) -> Response {
+    let session_id = match sessions.resolve_session(session.as_deref()).await {
+        Ok(id) => id,
+        Err(error) => return Response::error(request_id, error),
+    };
+
+    match sessions.session_logs(&session_id).await {
+        Ok(logs) => Response::success(
+            request_id,
+            ResponseData::Logs {
+                bytes: logs.bytes,
+                total_bytes: logs.total_bytes,
+                retained_bytes: logs.retained_bytes,
+                dropped_bytes: logs.dropped_bytes,
+                truncated: logs.truncated,
+            },
+        ),
+        Err(error) => Response::error(request_id, error),
     }
 }
 
@@ -1375,6 +1457,129 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
+    #[test]
+    fn retention_environment_value_is_validated() {
+        assert_eq!(parse_retain_bytes(None).expect("default"), 2 * 1024 * 1024);
+        assert_eq!(
+            parse_retain_bytes(Some(std::ffi::OsStr::new("4096"))).expect("configured value"),
+            4096
+        );
+        assert!(parse_retain_bytes(Some(std::ffi::OsStr::new("many"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_request_cannot_dispatch_logs() {
+        let response = handle_request(
+            Request {
+                id: "legacy-logs".to_string(),
+                command: Command::Logs { session: None },
+                protocol: 0,
+            },
+            Arc::new(SessionManager::new()),
+            Arc::new(Notify::new()),
+        )
+        .await;
+
+        assert!(!response.success);
+        assert_eq!(response.protocol, PROTOCOL_VERSION);
+        assert!(matches!(
+            response.error.map(|error| error.code),
+            Some(ErrorCode::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn logs_returns_bounded_ordered_raw_output_over_the_socket() {
+        let temp_dir = std::env::temp_dir();
+        let socket_path = temp_dir.join(format!("pilotty-logs-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+        let server = DaemonServer::bind_to_with_retain_bytes(socket_path.clone(), pid_path, 4)
+            .await
+            .expect("bind server");
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(3), server.run()).await;
+        });
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to server");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let spawn = Request::new(
+            "spawn-logs",
+            Command::Spawn {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf abcdef; sleep 2".to_string(),
+                ],
+                session_name: Some("logs-test".to_string()),
+                cwd: None,
+                retain_bytes: None,
+            },
+        );
+        writer
+            .write_all(
+                serde_json::to_string(&spawn)
+                    .expect("serialize spawn")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write spawn");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.flush().await.expect("flush spawn");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read spawn");
+        let spawn_response: Response = serde_json::from_str(&line).expect("parse spawn response");
+        assert!(spawn_response.success);
+
+        let logs = timeout(Duration::from_secs(2), async {
+            loop {
+                let request = Request::new(
+                    Uuid::new_v4().to_string(),
+                    Command::Logs {
+                        session: Some("logs-test".to_string()),
+                    },
+                );
+                writer
+                    .write_all(
+                        serde_json::to_string(&request)
+                            .expect("serialize logs")
+                            .as_bytes(),
+                    )
+                    .await
+                    .expect("write logs");
+                writer.write_all(b"\n").await.expect("write newline");
+                writer.flush().await.expect("flush logs");
+                line.clear();
+                reader.read_line(&mut line).await.expect("read logs");
+                let response: Response = serde_json::from_str(&line).expect("parse logs response");
+                if matches!(
+                    &response.data,
+                    Some(ResponseData::Logs { total_bytes: 6, .. })
+                ) {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retained output");
+
+        assert_eq!(
+            logs.data,
+            Some(ResponseData::Logs {
+                bytes: b"cdef".to_vec(),
+                total_bytes: 6,
+                retained_bytes: 4,
+                dropped_bytes: 2,
+                truncated: true,
+            })
+        );
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[tokio::test]
     async fn test_daemon_accepts_and_responds() {
         // Use a temp socket path
@@ -1619,6 +1824,7 @@ mod tests {
                 command: vec!["echo".to_string(), "hello from test".to_string()],
                 session_name: Some("test-snap".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1727,6 +1933,7 @@ mod tests {
                 command: vec!["echo".to_string(), "full format test".to_string()],
                 session_name: Some("full-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1846,6 +2053,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("type-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -1967,6 +2175,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("key-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2130,6 +2339,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("click-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2227,6 +2437,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("scroll-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2335,6 +2546,7 @@ mod tests {
                 command: vec!["echo".to_string(), "hello world marker".to_string()],
                 session_name: Some("waitfor-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2428,6 +2640,7 @@ mod tests {
                 command: vec!["echo".to_string(), "version 1.2.3 ready".to_string()],
                 session_name: Some("waitfor-re-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2520,6 +2733,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("waitfor-to-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2610,6 +2824,7 @@ mod tests {
                 command: vec!["echo".to_string(), "test".to_string()],
                 session_name: Some("waitfor-bad-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2701,6 +2916,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("await-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -2869,6 +3085,7 @@ mod tests {
                 command: vec!["cat".to_string()],
                 session_name: Some("await-static-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -3005,6 +3222,7 @@ mod tests {
                 ],
                 session_name: Some("settle-busy-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -3103,6 +3321,7 @@ mod tests {
                 command: vec!["pwd".to_string()],
                 session_name: Some("bad-cwd-test".to_string()),
                 cwd: Some("/nonexistent/path/that/does/not/exist".to_string()),
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();
@@ -3180,6 +3399,7 @@ mod tests {
                 ],
                 session_name: Some("elem-test".to_string()),
                 cwd: None,
+                retain_bytes: None,
             },
         };
         let request_json = serde_json::to_string(&spawn_request).unwrap();

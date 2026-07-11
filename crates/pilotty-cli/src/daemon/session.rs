@@ -18,6 +18,7 @@ use pilotty_core::protocol::SessionInfo;
 use pilotty_core::snapshot::compute_content_hash;
 
 use crate::daemon::pty::{AsyncPtyHandle, PtySession, TermSize};
+use crate::daemon::retention::{RetentionRing, RetentionSnapshot, DEFAULT_RETAIN_BYTES};
 use crate::daemon::terminal::TerminalEmulator;
 
 /// Unique identifier for a session.
@@ -138,6 +139,7 @@ struct Session {
     created_at: DateTime<Utc>,
     /// Async handle for PTY I/O.
     pty: AsyncPtyHandle,
+    retention: Arc<Mutex<RetentionRing>>,
     observed_terminal: Arc<Mutex<ObservedTerminal>>,
     pump_state: watch::Receiver<PumpState>,
     pump_task: Mutex<PumpTask>,
@@ -311,6 +313,7 @@ const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn run_output_pump(
     mut read_rx: mpsc::Receiver<Vec<u8>>,
+    retention: Arc<Mutex<RetentionRing>>,
     observed_terminal: Arc<Mutex<ObservedTerminal>>,
     state_tx: watch::Sender<PumpState>,
 ) {
@@ -349,6 +352,7 @@ async fn run_output_pump(
             }
         }
 
+        retention.lock().await.append(&batch);
         let revision = {
             let mut terminal = observed_terminal.lock().await;
             terminal.emulator.feed(&batch);
@@ -372,6 +376,7 @@ const MAX_SESSIONS: usize = 100;
 /// Thread-safe via interior mutability with RwLock.
 pub struct SessionManager {
     sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
+    default_retain_bytes: usize,
     /// Global snapshot counter for unique snapshot IDs.
     snapshot_counter: AtomicU64,
 }
@@ -385,8 +390,14 @@ impl Default for SessionManager {
 impl SessionManager {
     /// Create a new session manager.
     pub fn new() -> Self {
+        Self::with_default_retain_bytes(DEFAULT_RETAIN_BYTES)
+    }
+
+    /// Create a session manager with an explicit default retention limit.
+    pub(crate) fn with_default_retain_bytes(default_retain_bytes: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            default_retain_bytes,
             snapshot_counter: AtomicU64::new(1),
         }
     }
@@ -407,12 +418,25 @@ impl SessionManager {
     /// - Spawn fails
     ///
     /// If `cwd` is provided, the spawned process runs in that directory.
+    #[cfg(test)]
     pub async fn create_session(
         &self,
         command: Vec<String>,
         name: Option<String>,
         size: Option<TermSize>,
         cwd: Option<String>,
+    ) -> Result<SessionId, ApiError> {
+        self.create_session_with_retention(command, name, size, cwd, None)
+            .await
+    }
+
+    pub async fn create_session_with_retention(
+        &self,
+        command: Vec<String>,
+        name: Option<String>,
+        size: Option<TermSize>,
+        cwd: Option<String>,
+        retain_bytes: Option<usize>,
     ) -> Result<SessionId, ApiError> {
         let name = name.or_else(|| Some("default".to_string()));
 
@@ -440,6 +464,9 @@ impl SessionManager {
         let (pty, read_rx) = AsyncPtyHandle::new(pty_session)
             .map_err(|error| ApiError::spawn_failed(&command, &format!("{error:#}")))?;
 
+        let retention = Arc::new(Mutex::new(RetentionRing::new(
+            retain_bytes.unwrap_or(self.default_retain_bytes),
+        )));
         let observed_terminal = Arc::new(Mutex::new(ObservedTerminal {
             emulator: TerminalEmulator::new(size),
             revision: 0,
@@ -453,6 +480,7 @@ impl SessionManager {
         let (pump_state_tx, pump_state) = watch::channel(initial_pump_state);
         let pump_handle = tokio::spawn(run_output_pump(
             read_rx,
+            retention.clone(),
             observed_terminal.clone(),
             pump_state_tx,
         ));
@@ -464,6 +492,7 @@ impl SessionManager {
             command,
             created_at: Utc::now(),
             pty,
+            retention,
             observed_terminal,
             pump_state,
             pump_task: Mutex::new(PumpTask::new(pump_handle)),
@@ -587,6 +616,13 @@ impl SessionManager {
             .write(data)
             .await
             .map_err(|e| ApiError::write_failed(&e.to_string()))
+    }
+
+    /// Capture the retained raw output and its exact accounting.
+    pub(crate) async fn session_logs(&self, id: &SessionId) -> Result<RetentionSnapshot, ApiError> {
+        let session = self.session(id).await?;
+        let snapshot = session.retention.lock().await.snapshot();
+        Ok(snapshot)
     }
 
     /// Resize a session's terminal.
@@ -1257,6 +1293,75 @@ mod tests {
         })
         .await
         .expect("an exited session must not stay live while a descendant holds the PTY open");
+    }
+
+    #[tokio::test]
+    async fn configured_default_is_injected_into_new_sessions() {
+        let manager = SessionManager::with_default_retain_bytes(4);
+        let id = manager
+            .create_session_with_retention(
+                vec!["printf".to_string(), "abcdef".to_string()],
+                Some("default-retention".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create session");
+
+        let logs = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let logs = manager.session_logs(&id).await.expect("read logs");
+                if logs.total_bytes == 6 {
+                    break logs;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session output");
+
+        assert_eq!(logs.bytes, b"cdef");
+        assert_eq!(logs.retained_bytes, 4);
+        assert_eq!(logs.dropped_bytes, 2);
+        assert!(logs.truncated);
+        manager.kill_session(&id).await.expect("remove session");
+    }
+
+    #[tokio::test]
+    async fn session_override_retains_ordered_raw_output() {
+        let manager = SessionManager::with_default_retain_bytes(2);
+        let expected = b"\x1b[31mred\x1b[0m";
+        let id = manager
+            .create_session_with_retention(
+                vec![
+                    "printf".to_string(),
+                    String::from_utf8(expected.to_vec()).expect("valid test bytes"),
+                ],
+                Some("retention-override".to_string()),
+                None,
+                None,
+                Some(expected.len()),
+            )
+            .await
+            .expect("create session");
+
+        let logs = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let logs = manager.session_logs(&id).await.expect("read logs");
+                if logs.total_bytes == expected.len() as u64 {
+                    break logs;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session output");
+
+        assert_eq!(logs.bytes, expected);
+        assert_eq!(logs.dropped_bytes, 0);
+        assert!(!logs.truncated);
+        manager.kill_session(&id).await.expect("remove session");
     }
 
     #[tokio::test]

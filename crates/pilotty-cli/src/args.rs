@@ -95,6 +95,9 @@ Examples:
     /// List all active sessions
     ListSessions,
 
+    /// Print retained raw output for a session
+    Logs(LogsArgs),
+
     /// Resize the terminal
     Resize(ResizeArgs),
 
@@ -135,10 +138,21 @@ pub struct SpawnArgs {
     /// Working directory for the spawned process [default: current directory]
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
+
+    /// Maximum raw output bytes retained for this session
+    #[arg(long, value_name = "BYTES")]
+    pub retain_bytes: Option<u64>,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct KillArgs {
+    /// Target session by name or ID [default: default]
+    #[arg(short, long, help = SESSION_HELP)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LogsArgs {
     /// Target session by name or ID [default: default]
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,
@@ -303,6 +317,26 @@ mod tests {
                 assert_eq!(args.command, vec!["bash", "-c", "echo hello"]);
             }
             _ => panic!("Expected spawn command"),
+        }
+    }
+
+    #[test]
+    fn spawn_parses_retention_override() {
+        let cli = Cli::parse_from(["pilotty", "spawn", "--retain-bytes", "4096", "sh"]);
+
+        match cli.command {
+            Commands::Spawn(args) => assert_eq!(args.retain_bytes, Some(4096)),
+            _ => panic!("Expected spawn command"),
+        }
+    }
+
+    #[test]
+    fn logs_parses_session_target() {
+        let cli = Cli::parse_from(["pilotty", "logs", "--session", "editor"]);
+
+        match cli.command {
+            Commands::Logs(args) => assert_eq!(args.session.as_deref(), Some("editor")),
+            _ => panic!("Expected logs command"),
         }
     }
 }

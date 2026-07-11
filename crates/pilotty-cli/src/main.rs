@@ -5,6 +5,7 @@ mod daemon;
 
 use clap::Parser;
 use pilotty_core::protocol::{Command, Request, ResponseData, ScrollDirection, SnapshotFormat};
+use std::io::Write;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -50,6 +51,7 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
             }),
+            retain_bytes: args.retain_bytes,
         }),
         Commands::Kill(args) => Some(Command::Kill {
             session: args.session.clone(),
@@ -88,6 +90,9 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
             session: args.session.clone(),
         }),
         Commands::ListSessions => Some(Command::ListSessions),
+        Commands::Logs(args) => Some(Command::Logs {
+            session: args.session.clone(),
+        }),
         Commands::Resize(args) => Some(Command::Resize {
             cols: args.cols,
             rows: args.rows,
@@ -137,6 +142,20 @@ fn run_client_command(cli: Cli) -> anyhow::Result<()> {
                         content,
                     } => {
                         println!("{}", content);
+                    }
+                    ResponseData::Logs {
+                        bytes,
+                        total_bytes,
+                        retained_bytes,
+                        dropped_bytes,
+                        truncated,
+                    } => {
+                        std::io::stdout().write_all(&bytes)?;
+                        std::io::stdout().flush()?;
+                        eprintln!(
+                            "retention: total_bytes={total_bytes} retained_bytes={retained_bytes} \
+                             dropped_bytes={dropped_bytes} truncated={truncated}"
+                        );
                     }
                     _ => println!("{}", serde_json::to_string_pretty(&data)?),
                 }

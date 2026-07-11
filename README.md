@@ -107,6 +107,7 @@ pilotty stop
 pilotty spawn <command>           # Spawn a TUI app (e.g., pilotty spawn vim file.txt)
 pilotty spawn --name myapp <cmd>  # Spawn with a custom session name
 pilotty spawn --cwd /path cmd     # Spawn in a specific working directory
+pilotty spawn --retain-bytes 1048576 <cmd> # Override retained output limit
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
@@ -114,6 +115,18 @@ pilotty stop                      # Stop the daemon and all sessions
 pilotty daemon                    # Manually start daemon (usually auto-starts)
 pilotty examples                  # Show end-to-end workflow example
 ```
+
+### Retained Output
+
+```bash
+pilotty logs                      # Raw output bytes from the default session
+pilotty logs -s myapp             # Raw output bytes from a named session
+pilotty logs -s myapp > output.bin # Save raw ANSI evidence without metadata
+```
+
+`logs` writes retained output bytes to stdout and exact retention accounting to stderr.
+Retention is bounded to 2 MiB per session by default, and reports when older bytes were
+dropped.
 
 ### Screen Capture
 
@@ -397,6 +410,7 @@ All errors include AI-friendly suggestions:
 |----------|-------------|
 | `PILOTTY_SESSION` | Default session name |
 | `PILOTTY_SOCKET_DIR` | Override socket directory |
+| `PILOTTY_RETAIN_BYTES` | Default retained raw output bytes per session (default: 2 MiB) |
 | `RUST_LOG` | Logging level (e.g., `debug`, `info`) |
 
 ## Usage with AI Agents
