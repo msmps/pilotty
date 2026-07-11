@@ -74,6 +74,7 @@ HASH=$(pilotty snapshot | jq '.content_hash')
 pilotty key Enter
 pilotty snapshot --await-change $HASH           # Block until screen changes
 pilotty snapshot --await-change $HASH --settle 50  # Wait for 50ms stability
+pilotty snapshot --settle 50 --strict           # Exit nonzero on deadline/exit
 ```
 
 ### Input
@@ -132,6 +133,7 @@ pilotty wait-for "~" -s editor    # Wait in specific session
 | `--delay <ms>` | Delay between keys in a sequence (default: 0, max: 10000) |
 | `--await-change <hash>` | Block snapshot until content_hash differs |
 | `--settle <ms>` | Wait for screen to be stable for this many ms (default: 0) |
+| `--strict` | Exit 3 on capture deadline or 4 when the session exits |
 
 ### Environment variables
 
@@ -147,6 +149,7 @@ The `snapshot` command returns structured JSON with detected UI elements:
 
 ```json
 {
+  "outcome": "immediate",
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
@@ -229,6 +232,20 @@ pilotty snapshot --await-change $HASH --settle 100
 | `--await-change <HASH>` | Block until `content_hash` differs from this value |
 | `--settle <MS>` | After change detected, wait for screen to be stable for MS |
 | `-t, --timeout <MS>` | Maximum wait time (default: 30000) |
+| `--strict` | Keep evidence but exit nonzero for `deadline` or `exited` |
+
+Every snapshot reports why it returned:
+
+| Outcome | Meaning | Agent action |
+|---------|---------|--------------|
+| `immediate` | No wait requested | Read the current screen |
+| `changed` | `--await-change` was satisfied | Continue with the new screen |
+| `settled` | The requested stability window was satisfied | Treat the screen as stable |
+| `deadline` | Time expired; latest evidence is included | Inspect evidence, then retry with more time if useful |
+| `exited` | The session ended; final evidence is included | Do not send more input; inspect exit metadata or logs |
+
+Deadline and exit outcomes still exit 0 by default. Add `--strict` only when shell
+control flow should fail for those outcomes.
 
 **Why this is better than sleep:**
 - `sleep 1` is a guess - too short causes race conditions, too long slows automation
@@ -516,7 +533,7 @@ pilotty uses a background daemon for session management:
 
 - **Auto-start**: Daemon starts on first command
 - **Auto-stop**: Shuts down after 5 minutes with no sessions
-- **Session cleanup**: Sessions removed when process exits (within 500ms)
+- **Final evidence**: Exited sessions retain status, final screen, and bounded logs for up to 10 minutes
 - **Shared state**: Multiple CLI calls share sessions
 
 You rarely need to manage the daemon manually.
@@ -524,6 +541,14 @@ You rarely need to manage the daemon manually.
 ## Error Handling
 
 Errors include actionable suggestions:
+
+| Exit | Category | Agent action |
+|------|----------|--------------|
+| `0` | Command completed | Inspect snapshot `outcome`; it may be `deadline` or `exited` without `--strict` |
+| `1` | Generic/API error | Read the error code, message, and suggestion |
+| `2` | Usage error | Fix the command syntax |
+| `3` | Strict capture deadline | Inspect printed evidence and retry with more time if appropriate |
+| `4` | Session lifecycle ended | Do not retry input against that session; use `status`, `snapshot`, or `logs` |
 
 ```json
 {

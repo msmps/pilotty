@@ -381,6 +381,21 @@ impl SessionObserver {
         self.session.snapshot(with_elements).await
     }
 
+    /// Inspect the direct child without treating PTY EOF as process exit.
+    pub(crate) fn exit_metadata(&self) -> Result<Option<ExitMetadata>, ApiError> {
+        self.session
+            .observe_process_exit()
+            .map(|exit| {
+                exit.map(|exit| ExitMetadata {
+                    code: Some(exit.status.exit_code()),
+                    signal: exit.status.signal().map(ToOwned::to_owned),
+                    success: exit.status.success(),
+                    killed_by_client: false,
+                })
+            })
+            .map_err(|error| ApiError::internal(format!("Failed to inspect session exit: {error}")))
+    }
+
     /// Wait for output, EOF, pump failure, or the supplied duration.
     pub(crate) async fn wait_for_update(&mut self, duration: Duration) -> ObservationEvent {
         match tokio::time::timeout(duration, self.pump_state.changed()).await {
@@ -977,7 +992,7 @@ fn tombstone_status(tombstone: Tombstone) -> SessionStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::daemon::session::*;
 
     #[tokio::test]
     async fn test_create_and_get_session() {

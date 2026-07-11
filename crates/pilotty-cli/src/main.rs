@@ -4,7 +4,10 @@ mod args;
 mod daemon;
 
 use clap::Parser;
-use pilotty_core::protocol::{Command, Request, ResponseData, ScrollDirection, SnapshotFormat};
+use pilotty_core::error::ErrorCode;
+use pilotty_core::protocol::{
+    CaptureOutcome, Command, Request, ResponseData, ScrollDirection, SnapshotFormat,
+};
 use std::io::Write;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -13,7 +16,21 @@ use crate::args::{Cli, Commands};
 use crate::daemon::client::DaemonClient;
 use crate::daemon::server::DaemonServer;
 
-fn main() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliExitCode {
+    Success = 0,
+    GenericError = 1,
+    Timing = 3,
+    Lifecycle = 4,
+}
+
+impl CliExitCode {
+    fn value(self) -> u8 {
+        self as u8
+    }
+}
+
+fn main() -> std::process::ExitCode {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -27,14 +44,25 @@ fn main() {
     // Daemon command runs the server, all other commands are clients
     if let Commands::Daemon = cli.command {
         run_daemon();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // All other commands talk to the daemon
-    if let Err(e) = run_client_command(cli) {
-        error!("{}", e);
-        std::process::exit(1);
+    match run_client_command(cli) {
+        Ok(CliExitCode::Success) => {}
+        Ok(code) => {
+            if let Err(error) = std::io::stdout().flush() {
+                error!("Failed to flush command evidence: {}", error);
+            }
+            return std::process::ExitCode::from(code.value());
+        }
+        Err(e) => {
+            error!("{}", e);
+            return std::process::ExitCode::from(CliExitCode::GenericError.value());
+        }
     }
+
+    std::process::ExitCode::SUCCESS
 }
 
 /// Convert CLI args to a protocol Command.
@@ -58,11 +86,11 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         }),
         Commands::Snapshot(args) => Some(Command::Snapshot {
             session: args.session.clone(),
-            format: Some(match args.format {
+            format: match args.format {
                 crate::args::SnapshotFormat::Full => SnapshotFormat::Full,
                 crate::args::SnapshotFormat::Compact => SnapshotFormat::Compact,
                 crate::args::SnapshotFormat::Text => SnapshotFormat::Text,
-            }),
+            },
             await_change: args.await_change,
             settle_ms: args.settle,
             timeout_ms: args.timeout,
@@ -114,14 +142,27 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
 }
 
 /// Run a client command by connecting to the daemon.
-fn run_client_command(cli: Cli) -> anyhow::Result<()> {
+fn run_client_command(cli: Cli) -> anyhow::Result<CliExitCode> {
+    let strict = matches!(
+        &cli.command,
+        Commands::Snapshot(args) if args.strict
+    );
+    let targets_live_session = matches!(
+        &cli.command,
+        Commands::Type(_)
+            | Commands::Key(_)
+            | Commands::Click(_)
+            | Commands::Scroll(_)
+            | Commands::Resize(_)
+    );
+
     // Handle commands that don't need daemon communication
     let Some(command) = cli_to_command(&cli) else {
         // Examples command just prints and exits
         if let Commands::Examples = cli.command {
             println!("{}", crate::args::EXAMPLES_TEXT);
         }
-        return Ok(());
+        return Ok(CliExitCode::Success);
     };
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -137,12 +178,14 @@ fn run_client_command(cli: Cli) -> anyhow::Result<()> {
         let response = client.request(request).await?;
 
         // Print response
-        if response.success {
+        let exit_code = if response.success {
             if let Some(data) = response.data {
+                let outcome = data.capture_outcome();
                 match data {
                     ResponseData::Snapshot {
                         format: SnapshotFormat::Text,
                         content,
+                        ..
                     } => {
                         println!("{}", content);
                     }
@@ -162,14 +205,41 @@ fn run_client_command(cli: Cli) -> anyhow::Result<()> {
                     }
                     _ => println!("{}", serde_json::to_string_pretty(&data)?),
                 }
+
+                capture_exit_code(strict, outcome)
+            } else {
+                CliExitCode::Success
             }
         } else if let Some(err) = response.error {
             eprintln!("Error: {}", err);
-            std::process::exit(1);
-        }
+            api_error_exit_code(targets_live_session, &err.code)
+        } else {
+            CliExitCode::GenericError
+        };
 
-        Ok(())
+        Ok(exit_code)
     })
+}
+
+fn capture_exit_code(strict: bool, outcome: Option<CaptureOutcome>) -> CliExitCode {
+    if !strict {
+        return CliExitCode::Success;
+    }
+
+    match outcome {
+        Some(CaptureOutcome::Deadline) => CliExitCode::Timing,
+        Some(CaptureOutcome::Exited) => CliExitCode::Lifecycle,
+        Some(CaptureOutcome::Immediate | CaptureOutcome::Settled | CaptureOutcome::Changed)
+        | None => CliExitCode::Success,
+    }
+}
+
+fn api_error_exit_code(targets_live_session: bool, error: &ErrorCode) -> CliExitCode {
+    if targets_live_session && *error == ErrorCode::SessionExited {
+        CliExitCode::Lifecycle
+    } else {
+        CliExitCode::GenericError
+    }
 }
 
 /// Run the daemon server with graceful signal handling.
@@ -238,4 +308,48 @@ async fn sigterm() {
 #[cfg(not(unix))]
 async fn sigterm() {
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use pilotty_core::error::ErrorCode;
+    use pilotty_core::protocol::CaptureOutcome;
+
+    use crate::{api_error_exit_code, capture_exit_code, CliExitCode};
+
+    #[test]
+    fn strict_capture_exit_codes_are_categorical() {
+        assert_eq!(
+            capture_exit_code(true, Some(CaptureOutcome::Deadline)),
+            CliExitCode::Timing
+        );
+        assert_eq!(
+            capture_exit_code(true, Some(CaptureOutcome::Exited)),
+            CliExitCode::Lifecycle
+        );
+        assert_eq!(
+            capture_exit_code(true, Some(CaptureOutcome::Settled)),
+            CliExitCode::Success
+        );
+        assert_eq!(
+            capture_exit_code(false, Some(CaptureOutcome::Deadline)),
+            CliExitCode::Success
+        );
+    }
+
+    #[test]
+    fn exited_input_uses_lifecycle_exit_code() {
+        assert_eq!(
+            api_error_exit_code(true, &ErrorCode::SessionExited),
+            CliExitCode::Lifecycle
+        );
+        assert_eq!(
+            api_error_exit_code(false, &ErrorCode::SessionExited),
+            CliExitCode::GenericError
+        );
+        assert_eq!(
+            api_error_exit_code(true, &ErrorCode::InvalidInput),
+            CliExitCode::GenericError
+        );
+    }
 }
