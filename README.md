@@ -128,6 +128,12 @@ pilotty logs -s myapp > output.bin # Save raw ANSI evidence without metadata
 Retention is bounded to 2 MiB per session by default, and reports when older bytes were
 dropped.
 
+When a session exits, the daemon keeps bounded final evidence in memory for up to 10
+minutes: exit metadata, the final full screen, and the last 64 KiB of raw output.
+`snapshot` and `logs` continue to work during that window. Commands that require a live
+process return `SESSION_EXITED`. Tombstones disappear when they expire, are evicted, or
+the daemon restarts, and never keep the daemon running.
+
 ### Screen Capture
 
 ```bash

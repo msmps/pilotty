@@ -15,11 +15,15 @@ use pilotty_core::elements::classify::{detect, ClassifyContext};
 use pilotty_core::elements::Element;
 use pilotty_core::error::ApiError;
 use pilotty_core::protocol::SessionInfo;
-use pilotty_core::snapshot::compute_content_hash;
+use pilotty_core::snapshot::{compute_content_hash, CursorState, ScreenState, TerminalSize};
 
 use crate::daemon::pty::{AsyncPtyHandle, PtySession, TermSize};
 use crate::daemon::retention::{RetentionRing, RetentionSnapshot, DEFAULT_RETAIN_BYTES};
 use crate::daemon::terminal::TerminalEmulator;
+use crate::daemon::tombstone::{
+    ExitMetadata, Tombstone, TombstoneStore, TOMBSTONE_CAPACITY, TOMBSTONE_OUTPUT_BYTES,
+    TOMBSTONE_TTL,
+};
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -135,6 +139,7 @@ struct Session {
     name: Option<String>,
     /// Command that was spawned.
     command: Vec<String>,
+    cwd: Option<String>,
     /// When the session was created.
     created_at: DateTime<Utc>,
     /// Async handle for PTY I/O.
@@ -254,10 +259,74 @@ impl Session {
         .unwrap_or(false)
     }
 
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> bool {
         self.pty.terminate();
         let output_complete = self.wait_for_output_close().await;
         self.finish_pump(output_complete).await;
+        let _exit = self.observe_process_exit();
+        output_complete
+    }
+
+    async fn final_tombstone(
+        &self,
+        snapshot_id: u64,
+        output_complete: bool,
+        killed_by_client: bool,
+    ) -> Tombstone {
+        let snapshot = self.snapshot(true).await;
+        let output = self
+            .retention
+            .lock()
+            .await
+            .snapshot()
+            .into_tail(TOMBSTONE_OUTPUT_BYTES);
+        let process_exit = self
+            .process_exit
+            .lock()
+            .ok()
+            .and_then(|exit| exit.as_ref().cloned());
+        let exit = process_exit
+            .as_ref()
+            .map(|exit| ExitMetadata {
+                code: Some(exit.status.exit_code()),
+                signal: exit.status.signal().map(ToOwned::to_owned),
+                success: exit.status.success(),
+                killed_by_client,
+            })
+            .unwrap_or(ExitMetadata {
+                code: None,
+                signal: None,
+                success: false,
+                killed_by_client,
+            });
+        let ended_at_monotonic = Instant::now();
+        Tombstone {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            created_at: self.created_at,
+            ended_at: Utc::now(),
+            ended_at_monotonic,
+            exit,
+            output_complete,
+            final_screen: ScreenState {
+                snapshot_id,
+                size: TerminalSize {
+                    cols: snapshot.size.cols,
+                    rows: snapshot.size.rows,
+                },
+                cursor: CursorState {
+                    row: snapshot.cursor_pos.0,
+                    col: snapshot.cursor_pos.1,
+                    visible: snapshot.cursor_visible,
+                },
+                text: Some(snapshot.text),
+                elements: snapshot.elements,
+                content_hash: Some(snapshot.content_hash),
+            },
+            output,
+        }
     }
 }
 
@@ -274,6 +343,12 @@ pub(crate) enum ObservationEvent {
 pub(crate) struct SessionObserver {
     session: Arc<Session>,
     pump_state: watch::Receiver<PumpState>,
+}
+
+#[derive(Clone)]
+pub(crate) enum SessionEvidence {
+    Live(SessionId),
+    Exited(Box<Tombstone>),
 }
 
 impl SessionObserver {
@@ -376,6 +451,7 @@ const MAX_SESSIONS: usize = 100;
 /// Thread-safe via interior mutability with RwLock.
 pub struct SessionManager {
     sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
+    tombstones: Mutex<TombstoneStore>,
     default_retain_bytes: usize,
     /// Global snapshot counter for unique snapshot IDs.
     snapshot_counter: AtomicU64,
@@ -397,6 +473,7 @@ impl SessionManager {
     pub(crate) fn with_default_retain_bytes(default_retain_bytes: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            tombstones: Mutex::new(TombstoneStore::new(TOMBSTONE_CAPACITY, TOMBSTONE_TTL)),
             default_retain_bytes,
             snapshot_counter: AtomicU64::new(1),
         }
@@ -490,6 +567,7 @@ impl SessionManager {
             id: id.clone(),
             name,
             command,
+            cwd,
             created_at: Utc::now(),
             pty,
             retention,
@@ -502,13 +580,13 @@ impl SessionManager {
         let mut sessions = self.sessions.write().await;
         if sessions.len() >= MAX_SESSIONS {
             drop(sessions);
-            session.shutdown().await;
+            let _output_complete = session.shutdown().await;
             return Err(ApiError::session_limit_reached(MAX_SESSIONS));
         }
         if let Some(ref n) = session.name {
             if sessions.values().any(|s| s.name.as_deref() == Some(n)) {
                 drop(sessions);
-                session.shutdown().await;
+                let _output_complete = session.shutdown().await;
                 return Err(ApiError::duplicate_session_name(n));
             }
         }
@@ -542,7 +620,14 @@ impl SessionManager {
             .await
             .remove(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
-        session.shutdown().await;
+        let output_complete = session.shutdown().await;
+        let tombstone = session
+            .final_tombstone(self.next_snapshot_id(), output_complete, true)
+            .await;
+        self.tombstones
+            .lock()
+            .await
+            .insert(tombstone, Instant::now());
         Ok(())
     }
 
@@ -583,12 +668,13 @@ impl SessionManager {
     ///
     /// Returns an error if no matching session is found.
     pub async fn resolve_session(&self, identifier: Option<&str>) -> Result<SessionId, ApiError> {
-        match identifier {
+        let unresolved = match identifier {
             None => {
                 // Return default session
-                self.find_by_name("default")
-                    .await
-                    .ok_or_else(|| ApiError::session_not_found("default"))
+                if let Some(id) = self.find_by_name("default").await {
+                    return Ok(id);
+                }
+                "default"
             }
             Some(id_or_name) => {
                 let sessions = self.sessions.read().await;
@@ -599,13 +685,50 @@ impl SessionManager {
                 }
 
                 // Then try as session name
-                sessions
+                if let Some(id) = sessions
                     .values()
                     .find(|s| s.name.as_deref() == Some(id_or_name))
                     .map(|s| s.id.clone())
-                    .ok_or_else(|| ApiError::session_not_found(id_or_name))
+                {
+                    return Ok(id);
+                }
+                id_or_name
             }
+        };
+
+        match self.resolve_tombstone(unresolved).await {
+            Some(tombstone) => Err(ApiError::session_exited(
+                unresolved,
+                &tombstone.exit.description(),
+            )),
+            None => Err(ApiError::session_not_found(unresolved)),
         }
+    }
+
+    pub(crate) async fn resolve_evidence(
+        &self,
+        identifier: Option<&str>,
+    ) -> Result<SessionEvidence, ApiError> {
+        match self.resolve_session(identifier).await {
+            Ok(id) => Ok(SessionEvidence::Live(id)),
+            Err(error) if error.code == pilotty_core::error::ErrorCode::SessionExited => {
+                let identifier = identifier.unwrap_or("default");
+                self.resolve_tombstone(identifier)
+                    .await
+                    .map(Box::new)
+                    .map(SessionEvidence::Exited)
+                    .ok_or_else(|| ApiError::session_not_found(identifier))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn resolve_tombstone(&self, identifier: &str) -> Option<Tombstone> {
+        let mut tombstones = self.tombstones.lock().await;
+        let now = Instant::now();
+        tombstones
+            .get(&SessionId::from(identifier), now)
+            .or_else(|| tombstones.newest_by_name(identifier, now))
     }
 
     /// Write bytes to a session's PTY.
@@ -742,11 +865,16 @@ impl SessionManager {
 
                 for (id, session, output_complete) in finalizing_sessions {
                     session.finish_pump(output_complete).await;
+                    let tombstone = session
+                        .final_tombstone(manager.next_snapshot_id(), output_complete, false)
+                        .await;
+                    let mut tombstones = manager.tombstones.lock().await;
                     let mut sessions = manager.sessions.write().await;
                     let is_same_session = sessions
                         .get(&id)
                         .is_some_and(|current| Arc::ptr_eq(current, &session));
                     if is_same_session {
+                        tombstones.insert(tombstone, Instant::now());
                         sessions.remove(&id);
                         info!(
                             "Finalized session {} ({:?}), status: {}, output complete: {}",
@@ -757,6 +885,12 @@ impl SessionManager {
                         );
                     }
                 }
+
+                manager
+                    .tombstones
+                    .lock()
+                    .await
+                    .purge_expired(Instant::now());
             }
         });
     }
@@ -1276,7 +1410,7 @@ mod tests {
                 vec![
                     "python3".to_string(),
                     "-c".to_string(),
-                    "import os,signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); pid=os.fork(); os._exit(7) if pid else time.sleep(3)".to_string(),
+                    "import os,signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); pid=os.fork(); os._exit(7) if pid else (os.setsid(), os.write(1, b'descendant-open'), time.sleep(3))".to_string(),
                 ],
                 Some("inherited-pty".to_string()),
                 None,
@@ -1293,6 +1427,113 @@ mod tests {
         })
         .await
         .expect("an exited session must not stay live while a descendant holds the PTY open");
+
+        match manager
+            .resolve_evidence(Some("inherited-pty"))
+            .await
+            .expect("resolve finalized evidence")
+        {
+            SessionEvidence::Exited(tombstone) => {
+                if cfg!(target_os = "linux") {
+                    assert!(!tombstone.output_complete);
+                }
+            }
+            SessionEvidence::Live(_) => panic!("session should have finalized"),
+        }
+    }
+
+    #[tokio::test]
+    async fn natural_exit_preserves_final_screen_output_and_status() {
+        let manager = Arc::new(SessionManager::new());
+        manager
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf final-evidence; exit 7".to_string(),
+                ],
+                Some("natural-exit".to_string()),
+                None,
+                Some("/tmp".to_string()),
+            )
+            .await
+            .expect("create exiting session");
+        manager.spawn_cleaner();
+
+        let tombstone = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(SessionEvidence::Exited(tombstone)) =
+                    manager.resolve_evidence(Some("natural-exit")).await
+                {
+                    break tombstone;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("session finalization");
+
+        assert_eq!(tombstone.exit.code, Some(7));
+        assert!(!tombstone.exit.success);
+        assert!(!tombstone.exit.killed_by_client);
+        assert!(tombstone.output_complete);
+        assert_eq!(tombstone.cwd.as_deref(), Some("/tmp"));
+        assert!(tombstone
+            .final_screen
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("final-evidence")));
+        assert!(tombstone.output.bytes.ends_with(b"final-evidence"));
+        assert!(manager.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn tombstones_do_not_count_as_live_sessions_or_prevent_name_reuse() {
+        let manager = SessionManager::new();
+        let old_id = manager
+            .create_session(
+                vec!["cat".to_string()],
+                Some("reusable".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create session");
+        manager.kill_session(&old_id).await.expect("kill session");
+
+        assert!(manager.is_empty().await);
+        assert!(manager.list_sessions().await.is_empty());
+
+        let new_id = manager
+            .create_session(
+                vec!["cat".to_string()],
+                Some("reusable".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("reuse tombstoned name");
+
+        assert!(matches!(
+            manager
+                .resolve_evidence(Some("reusable"))
+                .await
+                .expect("live name wins"),
+            SessionEvidence::Live(id) if id == new_id
+        ));
+        match manager
+            .resolve_evidence(Some(&old_id.0))
+            .await
+            .expect("resolve killed session")
+        {
+            SessionEvidence::Exited(tombstone) => {
+                assert!(tombstone.exit.killed_by_client);
+                assert!(tombstone.exit.code.is_some() || tombstone.exit.signal.is_some());
+                assert_eq!(tombstone.id, old_id);
+            }
+            SessionEvidence::Live(_) => panic!("old session should be exited"),
+        }
+        manager.kill_session(&new_id).await.expect("remove session");
     }
 
     #[tokio::test]
