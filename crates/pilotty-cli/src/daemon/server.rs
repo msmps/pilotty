@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::paths;
-use crate::daemon::session::{SessionId, SessionManager};
+use crate::daemon::session::{ObservationEvent, SessionId, SessionManager};
 
 /// Maximum number of concurrent client connections to prevent resource exhaustion.
 const MAX_CONNECTIONS: usize = 100;
@@ -629,8 +629,8 @@ async fn handle_spawn(
     }
 }
 
-/// Poll interval for await_change/settle operations.
-const SNAPSHOT_POLL_INTERVAL_MS: u64 = 50;
+/// Minimum useful settle window retained for CLI compatibility.
+const MIN_SETTLE_MS: u64 = 50;
 
 /// Handle snapshot command.
 ///
@@ -658,14 +658,17 @@ async fn handle_snapshot(
     let format = format.unwrap_or(SnapshotFormat::Full);
     let with_elements = matches!(format, SnapshotFormat::Full);
     let timeout = Duration::from_millis(timeout_ms);
-    // Settle must be at least one poll interval to be meaningful
+    // Retain the shipped minimum settle window.
     let settle = Duration::from_millis(if settle_ms > 0 {
-        settle_ms.max(SNAPSHOT_POLL_INTERVAL_MS)
+        settle_ms.max(MIN_SETTLE_MS)
     } else {
         0
     });
-    let poll_interval = Duration::from_millis(SNAPSHOT_POLL_INTERVAL_MS);
     let start = Instant::now();
+    let mut observer = match sessions.observe_session(&session_id).await {
+        Ok(observer) => observer,
+        Err(error) => return Response::error(request_id, error),
+    };
 
     // Phase 1: If await_change is set, wait until content_hash differs
     if let Some(baseline_hash) = await_change {
@@ -684,14 +687,11 @@ async fn handle_snapshot(
                 );
             }
 
-            let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
-                Ok(data) => data,
-                Err(e) => return Response::error(request_id, e),
-            };
+            let snapshot = observer.current(false).await;
 
-            if snapshot.content_hash != Some(baseline_hash) {
+            if snapshot.content_hash != baseline_hash {
                 debug!(
-                    "Screen changed from hash {} to {:?} after {}ms",
+                    "Screen changed from hash {} to {} after {}ms",
                     baseline_hash,
                     snapshot.content_hash,
                     start.elapsed().as_millis()
@@ -699,17 +699,24 @@ async fn handle_snapshot(
                 break;
             }
 
-            tokio::time::sleep(poll_interval).await;
+            let remaining = timeout.saturating_sub(start.elapsed());
+            match observer.wait_for_update(remaining).await {
+                ObservationEvent::Updated => {}
+                ObservationEvent::OutputClosed => {
+                    tokio::time::sleep(remaining).await;
+                }
+                ObservationEvent::Deadline => {}
+                ObservationEvent::PumpFailed => {
+                    return pump_failure_response(request_id);
+                }
+            }
         }
     }
 
     // Phase 2: If settle_ms > 0, wait for screen stability
     if settle_ms > 0 {
         // Get fresh snapshot - don't rely on potentially stale hash from Phase 1
-        let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
-            Ok(data) => data,
-            Err(e) => return Response::error(request_id, e),
-        };
+        let snapshot = observer.current(false).await;
         let mut last_hash = snapshot.content_hash;
         let mut stable_since = Instant::now();
 
@@ -719,7 +726,7 @@ async fn handle_snapshot(
                     request_id,
                     ApiError::command_failed_with_suggestion(
                         format!(
-                            "Timeout after {}ms waiting for screen to stabilize for {}ms (last hash: {:?})",
+                            "Timeout after {}ms waiting for screen to stabilize for {}ms (last hash: {})",
                             timeout_ms,
                             settle_ms,
                             last_hash
@@ -729,15 +736,7 @@ async fn handle_snapshot(
                 );
             }
 
-            let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
-                Ok(data) => data,
-                Err(e) => return Response::error(request_id, e),
-            };
-
-            if snapshot.content_hash != last_hash {
-                last_hash = snapshot.content_hash;
-                stable_since = Instant::now();
-            } else if stable_since.elapsed() >= settle {
+            if stable_since.elapsed() >= settle {
                 debug!(
                     "Screen stabilized for {}ms after {}ms total",
                     settle_ms,
@@ -746,15 +745,32 @@ async fn handle_snapshot(
                 break;
             }
 
-            tokio::time::sleep(poll_interval).await;
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let until_settled = settle.saturating_sub(stable_since.elapsed());
+            let wait = remaining.min(until_settled);
+            match observer.wait_for_update(wait).await {
+                ObservationEvent::Updated => {
+                    let snapshot = observer.current(false).await;
+                    if snapshot.content_hash != last_hash {
+                        last_hash = snapshot.content_hash;
+                        stable_since = Instant::now();
+                    }
+                }
+                ObservationEvent::OutputClosed => tokio::time::sleep(wait).await,
+                ObservationEvent::Deadline => {}
+                ObservationEvent::PumpFailed => {
+                    return pump_failure_response(request_id);
+                }
+            }
         }
     }
 
     // Phase 3: Take final snapshot with requested format
-    let snapshot = match sessions.get_snapshot_data(&session_id, with_elements).await {
-        Ok(data) => data,
-        Err(e) => return Response::error(request_id, e),
-    };
+    let snapshot = observer.current(with_elements).await;
+    debug!(
+        "Captured session {} at revision {}",
+        session_id, snapshot.revision
+    );
     let (cursor_row, cursor_col) = snapshot.cursor_pos;
 
     match format {
@@ -784,7 +800,7 @@ async fn handle_snapshot(
                 },
                 text: Some(snapshot.text),
                 elements: snapshot.elements,
-                content_hash: snapshot.content_hash,
+                content_hash: Some(snapshot.content_hash),
             };
             Response::success(request_id, ResponseData::ScreenState(screen_state))
         }
@@ -1183,7 +1199,6 @@ async fn handle_wait_for(
 ) -> Response {
     use std::time::{Duration, Instant};
 
-    const POLL_INTERVAL_MS: u64 = 100;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
     let use_regex = regex.unwrap_or(false);
 
@@ -1216,8 +1231,11 @@ async fn handle_wait_for(
     };
 
     let start = Instant::now();
+    let mut observer = match sessions.observe_session(&session_id).await {
+        Ok(observer) => observer,
+        Err(error) => return Response::error(request_id, error),
+    };
 
-    // Poll loop
     loop {
         // Check timeout first
         let elapsed = start.elapsed();
@@ -1236,10 +1254,7 @@ async fn handle_wait_for(
         }
 
         // Get current screen text (no elements needed for wait_for)
-        let snapshot = match sessions.get_snapshot_data(&session_id, false).await {
-            Ok(data) => data,
-            Err(e) => return Response::error(request_id, e),
-        };
+        let snapshot = observer.current(false).await;
 
         // Check for match
         let matched = if let Some(ref re) = compiled_regex {
@@ -1269,9 +1284,28 @@ async fn handle_wait_for(
             );
         }
 
-        // Wait before next poll
-        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        let remaining = timeout.saturating_sub(start.elapsed());
+        match observer.wait_for_update(remaining).await {
+            ObservationEvent::Updated => {}
+            ObservationEvent::OutputClosed => {
+                tokio::time::sleep(remaining).await;
+            }
+            ObservationEvent::Deadline => {}
+            ObservationEvent::PumpFailed => {
+                return pump_failure_response(request_id);
+            }
+        }
     }
+}
+
+fn pump_failure_response(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        ApiError::command_failed_with_suggestion(
+            "Session output pump stopped unexpectedly",
+            "Inspect daemon logs, then stop and restart the daemon before retrying.",
+        ),
+    )
 }
 
 /// Handle shutdown command - gracefully stop the daemon.
