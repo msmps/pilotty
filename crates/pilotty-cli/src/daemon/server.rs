@@ -2686,6 +2686,241 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Regression test: await_change must actually wait. Before the fix, the
+    /// wait loop polled with `with_elements = false`, which returned
+    /// `content_hash: None`, so `None != Some(baseline)` broke the loop on the
+    /// first iteration and await_change returned instantly on an unchanged
+    /// screen.
+    #[tokio::test]
+    async fn test_snapshot_await_change_times_out_on_static_screen() {
+        let temp_dir = std::env::temp_dir();
+        let socket_path =
+            temp_dir.join(format!("pilotty-await-static-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(10), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Spawn cat with no input: the screen stays empty and static
+        let spawn_request = Request {
+            id: "spawn-1".to_string(),
+            command: Command::Spawn {
+                command: vec!["cat".to_string()],
+                session_name: Some("await-static-test".to_string()),
+                cwd: None,
+            },
+        };
+        let request_json = serde_json::to_string(&spawn_request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Take baseline snapshot to get the current hash
+        let snap_request = Request {
+            id: "snap-baseline".to_string(),
+            command: Command::Snapshot {
+                session: Some("await-static-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+                await_change: None,
+                settle_ms: 0,
+                timeout_ms: 30000,
+            },
+        };
+        let snap_json = serde_json::to_string(&snap_request).unwrap();
+        writer.write_all(snap_json.as_bytes()).await.expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        let baseline_response: Response =
+            serde_json::from_str(&response_line).expect("parse baseline response");
+        let baseline_hash = match baseline_response.data {
+            Some(ResponseData::ScreenState(state)) => state.content_hash.expect("should have hash"),
+            _ => panic!("Expected ScreenState"),
+        };
+
+        // Await a change that never comes: must time out, not return instantly
+        let start = std::time::Instant::now();
+        let await_request = Request {
+            id: "snap-await".to_string(),
+            command: Command::Snapshot {
+                session: Some("await-static-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+                await_change: Some(baseline_hash),
+                settle_ms: 0,
+                timeout_ms: 500,
+            },
+        };
+        let await_json = serde_json::to_string(&await_request).unwrap();
+        writer
+            .write_all(await_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+        let elapsed = start.elapsed();
+
+        let await_response: Response =
+            serde_json::from_str(&response_line).expect("parse await response");
+        assert!(
+            !await_response.success,
+            "Awaiting a change on a static screen should time out, not succeed"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Should have waited close to the 500ms timeout, returned after {:?}",
+            elapsed
+        );
+        let error = await_response.error.expect("should have error");
+        assert!(
+            error.message.contains("Timeout"),
+            "Error should mention timeout, got: {}",
+            error.message
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Regression test: settle must detect an unstable screen. Before the fix,
+    /// the settle loop's hashes were always `None`, so `None == None` counted
+    /// as stable and settle degraded to a fixed sleep — the "kept changing"
+    /// timeout branch was unreachable.
+    #[tokio::test]
+    async fn test_snapshot_settle_times_out_when_screen_keeps_changing() {
+        let temp_dir = std::env::temp_dir();
+        let socket_path = temp_dir.join(format!("pilotty-settle-busy-{}.sock", std::process::id()));
+        let pid_path = socket_path.with_extension("pid");
+
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("Failed to bind server");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(10), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("Failed to connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // Spawn a command that keeps changing the screen
+        let spawn_request = Request {
+            id: "spawn-1".to_string(),
+            command: Command::Spawn {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "i=0; while :; do i=$((i+1)); echo tick $i; sleep 0.02; done".to_string(),
+                ],
+                session_name: Some("settle-busy-test".to_string()),
+                cwd: None,
+            },
+        };
+        let request_json = serde_json::to_string(&spawn_request).unwrap();
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Ask for a settled screen: it never settles, so this must time out
+        let start = std::time::Instant::now();
+        let settle_request = Request {
+            id: "snap-settle".to_string(),
+            command: Command::Snapshot {
+                session: Some("settle-busy-test".to_string()),
+                format: Some(SnapshotFormat::Full),
+                await_change: None,
+                settle_ms: 200,
+                timeout_ms: 800,
+            },
+        };
+        let settle_json = serde_json::to_string(&settle_request).unwrap();
+        writer
+            .write_all(settle_json.as_bytes())
+            .await
+            .expect("write");
+        writer.write_all(b"\n").await.expect("newline");
+        writer.flush().await.expect("flush");
+
+        response_line.clear();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout")
+            .expect("read");
+        let elapsed = start.elapsed();
+
+        let settle_response: Response =
+            serde_json::from_str(&response_line).expect("parse settle response");
+        assert!(
+            !settle_response.success,
+            "Settle on a continuously changing screen should time out, not succeed"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "Should have waited close to the 800ms timeout, returned after {:?}",
+            elapsed
+        );
+        let error = settle_response.error.expect("should have error");
+        assert!(
+            error.message.contains("stabilize"),
+            "Error should mention stabilization, got: {}",
+            error.message
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[tokio::test]
     async fn test_spawn_with_invalid_cwd_fails() {
         let temp_dir = std::env::temp_dir();

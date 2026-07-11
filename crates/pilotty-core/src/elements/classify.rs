@@ -604,7 +604,7 @@ pub fn classify(clusters: Vec<Cluster>, ctx: &ClassifyContext) -> Vec<Element> {
     }
 
     // Sort by position (row, then col) for consistent ordering
-    detected.sort_by(|a, b| (a.row, a.col).cmp(&(b.row, b.col)));
+    detected.sort_by_key(|e| (e.row, e.col));
 
     // Convert to Elements
     detected
