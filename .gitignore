@@ -15,6 +15,9 @@ target/
 .env
 .env.local
 
+# Reference clones for competitive auditing
+.repos/
+
 # Agent/AI tooling
 .opencode/
 .claude/
@@ -24,6 +27,7 @@ AGENTS.md
 
 # Internal docs (not for public repo)
 docs/
+specs/
 TODO*.md
 
 # Examples (local dev only)
@@ -32,3 +36,4 @@ examples/
 # npm - binaries are downloaded during release
 npm/bin/pilotty-*
 npm/node_modules/
+.overseer/
