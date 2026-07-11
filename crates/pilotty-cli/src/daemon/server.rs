@@ -45,6 +45,10 @@ pub struct DaemonServer {
 impl DaemonServer {
     /// Create a new daemon server bound to the default socket path.
     pub async fn bind() -> Result<Self> {
+        // The default socket directory is derived from the environment and
+        // needs 0700 permissions; explicit-path binds (bind_to) must not
+        // touch it, so it is prepared here rather than in bind_to.
+        paths::ensure_socket_dir().context("Failed to create socket directory")?;
         let socket_path = paths::get_socket_path(None);
         let pid_path = paths::get_pid_path(None);
         Self::bind_to(socket_path, pid_path).await
@@ -58,9 +62,6 @@ impl DaemonServer {
     /// 3. If daemon dead, remove stale socket and retry
     /// 4. If daemon alive, return error
     pub async fn bind_to(socket_path: PathBuf, pid_path: PathBuf) -> Result<Self> {
-        // Ensure socket directory exists with secure permissions (0700)
-        paths::ensure_socket_dir().context("Failed to create socket directory")?;
-
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create socket directory for {:?}", socket_path)
