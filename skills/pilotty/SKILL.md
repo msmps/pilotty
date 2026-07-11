@@ -57,7 +57,7 @@ pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
 pilotty daemon                    # Manually start daemon (usually auto-starts)
-pilotty shutdown                  # Stop daemon and all sessions
+pilotty stop                      # Stop daemon and all sessions
 pilotty examples                  # Show end-to-end workflow example
 ```
 
