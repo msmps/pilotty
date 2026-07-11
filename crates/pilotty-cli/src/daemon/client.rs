@@ -5,7 +5,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use pilotty_core::protocol::{Request, Response, PROTOCOL_VERSION};
+use pilotty_core::error::ApiError;
+use pilotty_core::protocol::{
+    supports_protocol, Command, Request, Response, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -22,6 +25,26 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Client for communicating with the daemon.
 pub struct DaemonClient {
     stream: UnixStream,
+    daemon_protocol: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolAction {
+    Send,
+    Probe,
+    Reject { observed: u32, required: u32 },
+}
+
+fn protocol_action(observed: Option<u32>, required: u32) -> ProtocolAction {
+    if required == LEGACY_PROTOCOL_VERSION {
+        return ProtocolAction::Send;
+    }
+
+    match observed {
+        None => ProtocolAction::Probe,
+        Some(observed) if supports_protocol(observed, required) => ProtocolAction::Send,
+        Some(observed) => ProtocolAction::Reject { observed, required },
+    }
 }
 
 impl DaemonClient {
@@ -32,7 +55,10 @@ impl DaemonClient {
         // Try to connect directly first
         if let Ok(stream) = UnixStream::connect(&socket_path).await {
             debug!("Connected to existing daemon");
-            return Ok(Self { stream });
+            return Ok(Self {
+                stream,
+                daemon_protocol: None,
+            });
         }
 
         // Daemon not running, start it
@@ -41,7 +67,10 @@ impl DaemonClient {
 
         // Wait for daemon to become available, checking if it crashes
         let stream = Self::wait_for_daemon(&socket_path, child).await?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            daemon_protocol: None,
+        })
     }
 
     /// Start the daemon as a background process.
@@ -122,6 +151,49 @@ impl DaemonClient {
         request: Request,
         timeout_duration: Duration,
     ) -> Result<Response> {
+        let required = request.command.minimum_protocol();
+        self.ensure_protocol(&request.id, required, timeout_duration)
+            .await?;
+
+        let response = self.exchange(request, timeout_duration).await?;
+        self.daemon_protocol = Some(response.protocol);
+
+        if response.protocol < PROTOCOL_VERSION {
+            eprintln!(
+                "warning: the running daemon speaks protocol {} but this client speaks {}; \
+                 run 'pilotty stop' so the daemon restarts with the current binary",
+                response.protocol, PROTOCOL_VERSION
+            );
+        }
+
+        Ok(response)
+    }
+
+    async fn ensure_protocol(
+        &mut self,
+        request_id: &str,
+        required: u32,
+        timeout_duration: Duration,
+    ) -> Result<()> {
+        loop {
+            match protocol_action(self.daemon_protocol, required) {
+                ProtocolAction::Send => return Ok(()),
+                ProtocolAction::Probe => {
+                    let probe = Request::new(
+                        format!("{request_id}-protocol-probe"),
+                        Command::ListSessions,
+                    );
+                    let response = self.exchange(probe, timeout_duration).await?;
+                    self.daemon_protocol = Some(response.protocol);
+                }
+                ProtocolAction::Reject { observed, required } => {
+                    return Err(ApiError::protocol_upgrade_required(observed, required).into());
+                }
+            }
+        }
+    }
+
+    async fn exchange(&mut self, request: Request, timeout_duration: Duration) -> Result<Response> {
         let request_json =
             serde_json::to_string(&request).context("Failed to serialize request")?;
         debug!("Sending: {}", request_json);
@@ -155,15 +227,6 @@ impl DaemonClient {
 
         let response: Response =
             serde_json::from_str(&response_line).context("Failed to parse response")?;
-
-        if response.protocol < PROTOCOL_VERSION {
-            eprintln!(
-                "warning: the running daemon speaks protocol {} but this client speaks {}; \
-                 run 'pilotty stop' so the daemon restarts with the current binary",
-                response.protocol, PROTOCOL_VERSION
-            );
-        }
-
         Ok(response)
     }
 }
@@ -197,7 +260,10 @@ mod tests {
         let stream = UnixStream::connect(&socket_path)
             .await
             .expect("Failed to connect");
-        let mut client = DaemonClient { stream };
+        let mut client = DaemonClient {
+            stream,
+            daemon_protocol: None,
+        };
 
         // Send request
         let request = Request {
@@ -213,5 +279,29 @@ mod tests {
         // Clean up
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn unknown_peer_is_probed_only_for_versioned_commands() {
+        assert_eq!(protocol_action(None, 0), ProtocolAction::Send);
+        assert_eq!(
+            protocol_action(None, PROTOCOL_VERSION),
+            ProtocolAction::Probe
+        );
+    }
+
+    #[test]
+    fn observed_peer_protocol_decides_versioned_command_support() {
+        assert_eq!(
+            protocol_action(Some(0), PROTOCOL_VERSION),
+            ProtocolAction::Reject {
+                observed: 0,
+                required: PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            protocol_action(Some(PROTOCOL_VERSION), PROTOCOL_VERSION),
+            ProtocolAction::Send
+        );
     }
 }

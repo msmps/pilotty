@@ -107,6 +107,21 @@ impl ApiError {
         }
     }
 
+    /// Create a legacy-compatible error for protocol version skew.
+    pub fn protocol_upgrade_required(observed: u32, required: u32) -> Self {
+        Self {
+            code: ErrorCode::InvalidInput,
+            message: format!(
+                "Peer speaks protocol {}, but this operation requires protocol {}",
+                observed, required
+            ),
+            suggestion: Some(
+                "Update pilotty, run 'pilotty stop', and retry so the client and daemon use the same version"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn duplicate_session_name(name: &str) -> Self {
         Self {
             code: ErrorCode::InvalidInput,
@@ -315,5 +330,18 @@ mod tests {
         assert!(matches!(err.code, ErrorCode::SessionNotFound));
         assert_eq!(err.message, "Session 'x' not found");
         assert_eq!(err.suggestion, Some("hint".to_string()));
+    }
+
+    #[test]
+    fn protocol_upgrade_error_is_legacy_compatible_and_actionable() {
+        let err = ApiError::protocol_upgrade_required(0, 1);
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.minimum_protocol(), 0);
+        assert!(err.message.contains("protocol 0"));
+        assert!(err.message.contains("protocol 1"));
+        assert!(err.suggestion.as_deref().is_some_and(|suggestion| {
+            suggestion.contains("pilotty stop") && suggestion.contains("retry")
+        }));
     }
 }

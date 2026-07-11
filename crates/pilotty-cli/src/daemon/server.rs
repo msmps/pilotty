@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pilotty_core::error::ApiError;
 use pilotty_core::input::encode_mouse_click_combined;
-use pilotty_core::protocol::{Command, Request, Response, ResponseData, SnapshotFormat};
+use pilotty_core::protocol::{
+    supports_protocol, Command, Request, Response, ResponseData, SnapshotFormat,
+};
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -503,14 +505,23 @@ async fn handle_request(
     sessions: Arc<SessionManager>,
     shutdown: Arc<Notify>,
 ) -> Response {
-    debug!("Handling command: {:?}", request.command);
+    let request_protocol = request.protocol;
+    let request_id = request.id;
+    let command = request.command;
+    debug!("Handling command: {:?}", command);
 
-    match request.command {
+    if let Some(response) =
+        protocol_mismatch_response(&request_id, request_protocol, command.minimum_protocol())
+    {
+        return response;
+    }
+
+    let response = match command {
         Command::Spawn {
             command,
             session_name,
             cwd,
-        } => handle_spawn(&request.id, &sessions, command, session_name, cwd).await,
+        } => handle_spawn(&request_id, &sessions, command, session_name, cwd).await,
 
         Command::Snapshot {
             session,
@@ -520,7 +531,7 @@ async fn handle_request(
             timeout_ms,
         } => {
             handle_snapshot(
-                &request.id,
+                &request_id,
                 &sessions,
                 session,
                 format,
@@ -531,43 +542,57 @@ async fn handle_request(
             .await
         }
 
-        Command::ListSessions => handle_list_sessions(&request.id, &sessions).await,
+        Command::ListSessions => handle_list_sessions(&request_id, &sessions).await,
 
-        Command::Kill { session } => handle_kill(&request.id, &sessions, session).await,
+        Command::Kill { session } => handle_kill(&request_id, &sessions, session).await,
 
-        Command::Type { text, session } => handle_type(&request.id, &sessions, text, session).await,
+        Command::Type { text, session } => handle_type(&request_id, &sessions, text, session).await,
 
         Command::Key {
             key,
             delay_ms,
             session,
-        } => handle_key(&request.id, &sessions, key, delay_ms, session).await,
+        } => handle_key(&request_id, &sessions, key, delay_ms, session).await,
 
         Command::Click { row, col, session } => {
-            handle_click(&request.id, &sessions, row, col, session).await
+            handle_click(&request_id, &sessions, row, col, session).await
         }
 
         Command::Scroll {
             direction,
             amount,
             session,
-        } => handle_scroll(&request.id, &sessions, direction, amount, session).await,
+        } => handle_scroll(&request_id, &sessions, direction, amount, session).await,
 
         Command::WaitFor {
             pattern,
             timeout_ms,
             regex,
             session,
-        } => handle_wait_for(&request.id, &sessions, pattern, timeout_ms, regex, session).await,
+        } => handle_wait_for(&request_id, &sessions, pattern, timeout_ms, regex, session).await,
 
         Command::Resize {
             cols,
             rows,
             session,
-        } => handle_resize(&request.id, &sessions, cols, rows, session).await,
+        } => handle_resize(&request_id, &sessions, cols, rows, session).await,
 
-        Command::Shutdown => handle_shutdown(&request.id, sessions, shutdown).await,
+        Command::Shutdown => handle_shutdown(&request_id, sessions, shutdown).await,
+    };
+
+    protocol_mismatch_response(&request_id, request_protocol, response.minimum_protocol())
+        .unwrap_or(response)
+}
+
+fn protocol_mismatch_response(request_id: &str, observed: u32, required: u32) -> Option<Response> {
+    if supports_protocol(observed, required) {
+        return None;
     }
+
+    Some(Response::error(
+        request_id,
+        ApiError::protocol_upgrade_required(observed, required),
+    ))
 }
 
 /// Handle spawn command.
@@ -1408,6 +1433,63 @@ mod tests {
         // Clean up
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_client_can_use_existing_command_against_current_daemon() {
+        let short_id = Uuid::new_v4().simple().to_string();
+        let socket_path = std::path::PathBuf::from("/tmp")
+            .join(format!("pilotty-legacy-client-{}.sock", &short_id[..8]));
+        let pid_path = socket_path.with_extension("pid");
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
+            .await
+            .expect("bind server");
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(2), server.run()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect legacy client");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer
+            .write_all(b"{\"id\":\"legacy-1\",\"command\":{\"action\":\"list_sessions\"}}\n")
+            .await
+            .expect("write legacy request");
+        writer.flush().await.expect("flush legacy request");
+
+        let mut response_line = String::new();
+        timeout(Duration::from_secs(1), reader.read_line(&mut response_line))
+            .await
+            .expect("response timeout")
+            .expect("read response");
+        let response: Response = serde_json::from_str(&response_line).expect("parse response");
+
+        assert!(response.success);
+        assert_eq!(response.id, "legacy-1");
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn protocol_guard_returns_legacy_compatible_upgrade_error() {
+        assert!(protocol_mismatch_response("req-1", PROTOCOL_VERSION, PROTOCOL_VERSION).is_none());
+
+        let response = protocol_mismatch_response("req-2", 0, PROTOCOL_VERSION)
+            .expect("older peer must receive an upgrade response");
+        let error = response.error.expect("upgrade error");
+
+        assert_eq!(response.id, "req-2");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert_eq!(error.minimum_protocol(), 0);
+        assert!(error.suggestion.as_deref().is_some_and(|suggestion| {
+            suggestion.contains("pilotty stop") && suggestion.contains("retry")
+        }));
     }
 
     #[tokio::test]
