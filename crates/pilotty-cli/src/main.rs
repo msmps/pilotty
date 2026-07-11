@@ -123,10 +123,7 @@ fn run_client_command(cli: Cli) -> anyhow::Result<()> {
         let mut client = DaemonClient::connect().await?;
 
         // Build request
-        let request = Request {
-            id: Uuid::new_v4().to_string(),
-            command,
-        };
+        let request = Request::new(Uuid::new_v4().to_string(), command);
 
         // Send request and get response
         let response = client.request(request).await?;
