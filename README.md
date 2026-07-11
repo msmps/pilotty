@@ -111,6 +111,8 @@ pilotty spawn --retain-bytes 1048576 <cmd> # Override retained output limit
 pilotty kill                      # Kill default session
 pilotty kill -s myapp             # Kill specific session
 pilotty list-sessions             # List all active sessions
+pilotty status                    # Report default session lifecycle status
+pilotty status -s myapp           # Report a named session's status
 pilotty stop                      # Stop the daemon and all sessions
 pilotty daemon                    # Manually start daemon (usually auto-starts)
 pilotty examples                  # Show end-to-end workflow example
@@ -133,6 +135,20 @@ minutes: exit metadata, the final full screen, and the last 64 KiB of raw output
 `snapshot` and `logs` continue to work during that window. Commands that require a live
 process return `SESSION_EXITED`. Tombstones disappear when they expire, are evicted, or
 the daemon restarts, and never keep the daemon running.
+
+### Session Status
+
+```bash
+pilotty status                    # Status of the default session
+pilotty status -s myapp           # Status by session name or ID
+```
+
+`status` returns structured JSON with `state: "running"` or `state: "exited"`.
+Running sessions include their current geometry, command, working directory, creation
+time, idle duration, and retention accounting. Exited sessions include final geometry,
+exit code or signal, success and explicit-kill flags, creation and end times, output
+completeness, and retained-evidence accounting. Unknown, expired, or evicted sessions
+return `SESSION_NOT_FOUND`.
 
 ### Screen Capture
 

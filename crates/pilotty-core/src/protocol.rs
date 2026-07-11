@@ -3,25 +3,27 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
-use crate::snapshot::ScreenState;
+use crate::snapshot::{ScreenState, TerminalSize};
 
 /// Default timeout for snapshot await_change/settle operations (30 seconds).
 fn default_snapshot_timeout() -> u64 {
     30000
 }
 
-/// Current daemon protocol version.
-///
-/// Carried on every `Request` and `Response` so a client and an
-/// already-running daemon can detect version skew (e.g. mid-upgrade).
-/// Messages from binaries that predate versioning deserialize as version 0
-/// via `#[serde(default)]`. Bump when a change is incompatible; additive
-/// fields and enum variants do not require a bump on their own, but a client
-/// must treat a lower daemon version as "this command may not exist yet".
-pub const PROTOCOL_VERSION: u32 = 1;
-
 /// Protocol spoken by binaries that predate explicit versioning.
 pub const LEGACY_PROTOCOL_VERSION: u32 = 0;
+
+/// Versioned envelope shipped in v0.0.8.
+pub const PROTOCOL_V1: u32 = 1;
+
+/// Bounded retention and finalized-session evidence introduced for v0.0.9.
+pub const PROTOCOL_V2: u32 = 2;
+
+/// Current daemon protocol advertised on every request and response.
+///
+/// Historical minimum-version mappings below must use the stable version
+/// constants, not this moving alias.
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_V2;
 
 /// Whether an observed peer protocol satisfies a wire variant's requirement.
 pub fn supports_protocol(observed: u32, required: u32) -> bool {
@@ -39,7 +41,7 @@ impl ApiError {
             | ErrorCode::CommandFailed
             | ErrorCode::InvalidInput
             | ErrorCode::InternalError => LEGACY_PROTOCOL_VERSION,
-            ErrorCode::SessionExited => PROTOCOL_VERSION,
+            ErrorCode::SessionExited => PROTOCOL_V2,
         }
     }
 }
@@ -134,6 +136,8 @@ pub enum Command {
     ListSessions,
     /// Get the retained raw output for a session.
     Logs { session: Option<String> },
+    /// Get live or finalized lifecycle status for a session.
+    Status { session: Option<String> },
     /// Resize the terminal.
     Resize {
         cols: u16,
@@ -162,7 +166,8 @@ impl Command {
                 retain_bytes: Some(_),
                 ..
             }
-            | Self::Logs { .. } => PROTOCOL_VERSION,
+            | Self::Logs { .. }
+            | Self::Status { .. } => PROTOCOL_V2,
             Self::Spawn {
                 retain_bytes: None, ..
             }
@@ -283,6 +288,8 @@ pub enum ResponseData {
         dropped_bytes: u64,
         truncated: bool,
     },
+    /// Live or finalized lifecycle status for a session.
+    Status(SessionStatus),
 }
 
 impl ResponseData {
@@ -292,7 +299,7 @@ impl ResponseData {
     /// older client.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
-            Self::Logs { .. } => PROTOCOL_VERSION,
+            Self::Logs { .. } | Self::Status(_) => PROTOCOL_V2,
             Self::ScreenState(_)
             | Self::Snapshot { .. }
             | Self::SessionCreated { .. }
@@ -312,6 +319,46 @@ pub struct SessionInfo {
     pub created_at: String,
 }
 
+/// Exact accounting for a session's bounded raw-output evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionAccounting {
+    pub total_bytes: u64,
+    pub retained_bytes: u64,
+    pub dropped_bytes: u64,
+    pub truncated: bool,
+}
+
+/// Lifecycle status and available evidence for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionStatus {
+    Running {
+        id: String,
+        name: Option<String>,
+        command: Vec<String>,
+        cwd: Option<String>,
+        created_at: String,
+        size: TerminalSize,
+        idle_ms: u64,
+        retention: RetentionAccounting,
+    },
+    Exited {
+        id: String,
+        name: Option<String>,
+        command: Vec<String>,
+        cwd: Option<String>,
+        created_at: String,
+        ended_at: String,
+        size: TerminalSize,
+        exit_code: Option<u32>,
+        signal: Option<String>,
+        success: bool,
+        killed_by_client: bool,
+        output_complete: bool,
+        retention: RetentionAccounting,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,7 +367,7 @@ mod tests {
     fn request_serializes_with_protocol_version() {
         let request = Request::new("req-1", Command::ListSessions);
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"protocol\":1"), "got: {json}");
+        assert!(json.contains("\"protocol\":2"), "got: {json}");
     }
 
     #[test]
@@ -337,9 +384,9 @@ mod tests {
         // A current client's request must still parse if a field is unknown
         // to the receiver; serde ignores unknown fields by default. Guard
         // against someone adding deny_unknown_fields later.
-        let json = r#"{"id":"req-1","command":{"action":"list_sessions"},"protocol":1,"future_field":true}"#;
+        let json = r#"{"id":"req-1","command":{"action":"list_sessions"},"protocol":2,"future_field":true}"#;
         let request: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(request.protocol, 1);
+        assert_eq!(request.protocol, PROTOCOL_V2);
     }
 
     #[test]
@@ -389,9 +436,10 @@ mod tests {
 
     #[test]
     fn protocol_support_is_monotonic() {
-        assert!(supports_protocol(1, 0));
-        assert!(supports_protocol(1, 1));
-        assert!(!supports_protocol(0, 1));
+        assert!(supports_protocol(PROTOCOL_V2, LEGACY_PROTOCOL_VERSION));
+        assert!(supports_protocol(PROTOCOL_V2, PROTOCOL_V1));
+        assert!(supports_protocol(PROTOCOL_V2, PROTOCOL_V2));
+        assert!(!supports_protocol(PROTOCOL_V1, PROTOCOL_V2));
     }
 
     #[test]
@@ -409,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_commands_require_current_protocol() {
+    fn slice_a_wire_variants_require_protocol_v2() {
         let plain_spawn = Command::Spawn {
             command: vec!["sh".to_string()],
             session_name: None,
@@ -422,13 +470,36 @@ mod tests {
             cwd: None,
             retain_bytes: Some(1024),
         };
+        let status = SessionStatus::Running {
+            id: "session-1".to_string(),
+            name: Some("editor".to_string()),
+            command: vec!["vi".to_string(), "notes.txt".to_string()],
+            cwd: Some("/tmp".to_string()),
+            created_at: "2026-07-11T12:00:00Z".to_string(),
+            size: TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+            idle_ms: 250,
+            retention: RetentionAccounting {
+                total_bytes: 12,
+                retained_bytes: 10,
+                dropped_bytes: 2,
+                truncated: true,
+            },
+        };
 
         assert_eq!(plain_spawn.minimum_protocol(), LEGACY_PROTOCOL_VERSION);
-        assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_VERSION);
+        assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(
             Command::Logs { session: None }.minimum_protocol(),
-            PROTOCOL_VERSION
+            PROTOCOL_V2
         );
+        assert_eq!(
+            Command::Status { session: None }.minimum_protocol(),
+            PROTOCOL_V2
+        );
+        assert_eq!(ResponseData::Status(status).minimum_protocol(), PROTOCOL_V2);
     }
 
     #[test]
@@ -441,9 +512,39 @@ mod tests {
             truncated: true,
         };
 
-        assert_eq!(response.minimum_protocol(), PROTOCOL_VERSION);
+        assert_eq!(response.minimum_protocol(), PROTOCOL_V2);
         let json = serde_json::to_string(&response).expect("serialize logs response");
         let decoded: ResponseData = serde_json::from_str(&json).expect("deserialize logs response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn exited_status_round_trips_with_stable_state_and_evidence_fields() {
+        let response = ResponseData::Status(SessionStatus::Exited {
+            id: "session-1".to_string(),
+            name: Some("job".to_string()),
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+            cwd: None,
+            created_at: "2026-07-11T12:00:00Z".to_string(),
+            ended_at: "2026-07-11T12:00:01Z".to_string(),
+            size: TerminalSize { cols: 80, rows: 24 },
+            exit_code: Some(7),
+            signal: None,
+            success: false,
+            killed_by_client: false,
+            output_complete: true,
+            retention: RetentionAccounting {
+                total_bytes: 70_000,
+                retained_bytes: 65_536,
+                dropped_bytes: 4_464,
+                truncated: true,
+            },
+        });
+
+        let json = serde_json::to_string(&response).expect("serialize exited status");
+        assert!(json.contains("\"type\":\"status\""), "got: {json}");
+        assert!(json.contains("\"state\":\"exited\""), "got: {json}");
+        let decoded: ResponseData = serde_json::from_str(&json).expect("deserialize exited status");
         assert_eq!(decoded, response);
     }
 

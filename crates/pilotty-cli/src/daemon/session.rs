@@ -14,7 +14,7 @@ use tracing::{debug, info};
 use pilotty_core::elements::classify::{detect, ClassifyContext};
 use pilotty_core::elements::Element;
 use pilotty_core::error::ApiError;
-use pilotty_core::protocol::SessionInfo;
+use pilotty_core::protocol::{RetentionAccounting, SessionInfo, SessionStatus};
 use pilotty_core::snapshot::{compute_content_hash, CursorState, ScreenState, TerminalSize};
 
 use crate::daemon::pty::{AsyncPtyHandle, PtySession, TermSize};
@@ -165,6 +165,26 @@ impl Session {
             name: self.name.clone(),
             command: self.command.clone(),
             created_at: self.created_at.to_rfc3339(),
+        }
+    }
+
+    async fn status(&self) -> SessionStatus {
+        let pump_state = self.pump_state();
+        let size = self.observed_terminal.lock().await.size;
+        let retention = self.retention.lock().await.snapshot();
+
+        SessionStatus::Running {
+            id: self.id.0.clone(),
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            created_at: self.created_at.to_rfc3339(),
+            size: TerminalSize {
+                cols: size.cols,
+                rows: size.rows,
+            },
+            idle_ms: duration_millis(pump_state.last_output_at.elapsed()),
+            retention: retention_accounting(&retention),
         }
     }
 
@@ -723,6 +743,24 @@ impl SessionManager {
         }
     }
 
+    /// Report live runtime state or finalized evidence through one lifecycle seam.
+    pub(crate) async fn session_status(
+        &self,
+        identifier: Option<&str>,
+    ) -> Result<SessionStatus, ApiError> {
+        let evidence = self.resolve_evidence(identifier).await?;
+        match evidence {
+            SessionEvidence::Live(id) => match self.session(&id).await {
+                Ok(session) => Ok(session.status().await),
+                Err(_) => match self.resolve_evidence(identifier).await? {
+                    SessionEvidence::Live(id) => Ok(self.session(&id).await?.status().await),
+                    SessionEvidence::Exited(tombstone) => Ok(tombstone_status(*tombstone)),
+                },
+            },
+            SessionEvidence::Exited(tombstone) => Ok(tombstone_status(*tombstone)),
+        }
+    }
+
     async fn resolve_tombstone(&self, identifier: &str) -> Option<Tombstone> {
         let mut tombstones = self.tombstones.lock().await;
         let now = Instant::now();
@@ -903,6 +941,37 @@ fn exit_status_description(session: &Session) -> String {
             .map(|exit| exit.status.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         Err(_) => "unavailable".to_string(),
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn retention_accounting(retention: &RetentionSnapshot) -> RetentionAccounting {
+    RetentionAccounting {
+        total_bytes: retention.total_bytes,
+        retained_bytes: retention.retained_bytes,
+        dropped_bytes: retention.dropped_bytes,
+        truncated: retention.truncated,
+    }
+}
+
+fn tombstone_status(tombstone: Tombstone) -> SessionStatus {
+    SessionStatus::Exited {
+        id: tombstone.id.0,
+        name: tombstone.name,
+        command: tombstone.command,
+        cwd: tombstone.cwd,
+        created_at: tombstone.created_at.to_rfc3339(),
+        ended_at: tombstone.ended_at.to_rfc3339(),
+        size: tombstone.final_screen.size,
+        exit_code: tombstone.exit.code,
+        signal: tombstone.exit.signal,
+        success: tombstone.exit.success,
+        killed_by_client: tombstone.exit.killed_by_client,
+        output_complete: tombstone.output_complete,
+        retention: retention_accounting(&tombstone.output),
     }
 }
 
@@ -1603,6 +1672,187 @@ mod tests {
         assert_eq!(logs.dropped_bytes, 0);
         assert!(!logs.truncated);
         manager.kill_session(&id).await.expect("remove session");
+    }
+
+    #[tokio::test]
+    async fn status_tracks_live_session_through_failed_finalization() {
+        let manager = Arc::new(SessionManager::with_default_retain_bytes(4));
+        let id = manager
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf abcdef; sleep 1; exit 7".to_string(),
+                ],
+                Some("status-lifecycle".to_string()),
+                Some(TermSize {
+                    cols: 100,
+                    rows: 30,
+                }),
+                Some("/tmp".to_string()),
+            )
+            .await
+            .expect("create lifecycle session");
+        manager.spawn_cleaner();
+
+        let running = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = manager
+                    .session_status(Some("status-lifecycle"))
+                    .await
+                    .expect("read live status");
+                if matches!(
+                    &status,
+                    SessionStatus::Running {
+                        retention: RetentionAccounting { total_bytes: 6, .. },
+                        ..
+                    }
+                ) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live output retained");
+
+        match running {
+            SessionStatus::Running {
+                id: status_id,
+                name,
+                command,
+                cwd,
+                size,
+                retention,
+                ..
+            } => {
+                assert_eq!(status_id, id.0);
+                assert_eq!(name.as_deref(), Some("status-lifecycle"));
+                assert_eq!(command, vec!["sh", "-c", "printf abcdef; sleep 1; exit 7"]);
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(
+                    size,
+                    TerminalSize {
+                        cols: 100,
+                        rows: 30
+                    }
+                );
+                assert_eq!(retention.total_bytes, 6);
+                assert_eq!(retention.retained_bytes, 4);
+                assert_eq!(retention.dropped_bytes, 2);
+                assert!(retention.truncated);
+            }
+            SessionStatus::Exited { .. } => panic!("session should still be running"),
+        }
+
+        let exited = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(status @ SessionStatus::Exited { .. }) =
+                    manager.session_status(Some("status-lifecycle")).await
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("session finalization");
+
+        match exited {
+            SessionStatus::Exited {
+                id: status_id,
+                name,
+                command,
+                cwd,
+                created_at,
+                ended_at,
+                size,
+                exit_code,
+                signal,
+                success,
+                killed_by_client,
+                output_complete,
+                retention,
+                ..
+            } => {
+                assert_eq!(status_id, id.0);
+                assert_eq!(name.as_deref(), Some("status-lifecycle"));
+                assert_eq!(command, vec!["sh", "-c", "printf abcdef; sleep 1; exit 7"]);
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert!(DateTime::parse_from_rfc3339(&created_at).is_ok());
+                assert!(DateTime::parse_from_rfc3339(&ended_at).is_ok());
+                assert_eq!(
+                    size,
+                    TerminalSize {
+                        cols: 100,
+                        rows: 30
+                    }
+                );
+                assert_eq!(exit_code, Some(7));
+                assert_eq!(signal, None);
+                assert!(!success);
+                assert!(!killed_by_client);
+                assert!(output_complete);
+                assert_eq!(retention.total_bytes, 6);
+                assert_eq!(retention.retained_bytes, 4);
+                assert_eq!(retention.dropped_bytes, 2);
+                assert!(retention.truncated);
+            }
+            SessionStatus::Running { .. } => panic!("session should be finalized"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_explicit_kill_and_live_name_precedence() {
+        let manager = SessionManager::new();
+        let old_id = manager
+            .create_session(
+                vec!["cat".to_string()],
+                Some("status-reused".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create old session");
+        manager
+            .kill_session(&old_id)
+            .await
+            .expect("kill old session");
+
+        match manager
+            .session_status(Some(&old_id.0))
+            .await
+            .expect("read killed status")
+        {
+            SessionStatus::Exited {
+                killed_by_client, ..
+            } => assert!(killed_by_client),
+            SessionStatus::Running { .. } => panic!("killed session should be finalized"),
+        }
+
+        let new_id = manager
+            .create_session(
+                vec!["cat".to_string()],
+                Some("status-reused".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("reuse session name");
+
+        match manager
+            .session_status(Some("status-reused"))
+            .await
+            .expect("live name should win")
+        {
+            SessionStatus::Running { id, .. } => assert_eq!(id, new_id.0),
+            SessionStatus::Exited { .. } => panic!("live name must win over tombstone name"),
+        }
+
+        manager
+            .kill_session(&new_id)
+            .await
+            .expect("remove new session");
     }
 
     #[tokio::test]

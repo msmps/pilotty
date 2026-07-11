@@ -366,7 +366,7 @@ mod tests {
         let err = ApiError::session_exited("editor", "exit code 7");
 
         assert_eq!(err.code, ErrorCode::SessionExited);
-        assert_eq!(err.minimum_protocol(), crate::protocol::PROTOCOL_VERSION);
+        assert_eq!(err.minimum_protocol(), crate::protocol::PROTOCOL_V2);
         assert!(err.message.contains("editor"));
         assert!(err.message.contains("exit code 7"));
         assert!(err

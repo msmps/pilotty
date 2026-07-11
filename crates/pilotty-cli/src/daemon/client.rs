@@ -235,7 +235,7 @@ impl DaemonClient {
 mod tests {
     use super::*;
     use crate::daemon::server::DaemonServer;
-    use pilotty_core::protocol::{Command, ResponseData, PROTOCOL_VERSION};
+    use pilotty_core::protocol::{Command, ResponseData, PROTOCOL_V1, PROTOCOL_VERSION};
     use tokio::net::UnixListener;
 
     #[tokio::test]
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_daemon_is_probed_and_logs_is_rejected_before_transmission() {
+    async fn shipped_v1_daemon_is_probed_and_v2_command_is_rejected_before_transmission() {
         let socket_path =
             std::env::temp_dir().join(format!("pilotty-probe-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
@@ -326,7 +326,7 @@ mod tests {
                 success: true,
                 data: Some(ResponseData::Sessions { sessions: vec![] }),
                 error: None,
-                protocol: LEGACY_PROTOCOL_VERSION,
+                protocol: PROTOCOL_V1,
             };
             writer
                 .write_all(
@@ -363,7 +363,9 @@ mod tests {
             .await
             .expect_err("old daemon must be rejected");
 
-        assert!(error.to_string().contains("protocol 1"));
+        let message = error.to_string();
+        assert!(message.contains("speaks protocol 1"), "got: {message}");
+        assert!(message.contains("requires protocol 2"), "got: {message}");
         peer.await.expect("protocol fixture task");
         let _ = std::fs::remove_file(&socket_path);
     }

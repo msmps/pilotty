@@ -588,6 +588,8 @@ async fn handle_request(
 
         Command::Logs { session } => handle_logs(&request_id, &sessions, session).await,
 
+        Command::Status { session } => handle_status(&request_id, &sessions, session).await,
+
         Command::Kill { session } => handle_kill(&request_id, &sessions, session).await,
 
         Command::Type { text, session } => handle_type(&request_id, &sessions, text, session).await,
@@ -738,6 +740,18 @@ async fn handle_logs(
                 truncated: logs.truncated,
             },
         ),
+        Err(error) => Response::error(request_id, error),
+    }
+}
+
+/// Handle status command.
+async fn handle_status(
+    request_id: &str,
+    sessions: &SessionManager,
+    session: Option<String>,
+) -> Response {
+    match sessions.session_status(session.as_deref()).await {
+        Ok(status) => Response::success(request_id, ResponseData::Status(status)),
         Err(error) => Response::error(request_id, error),
     }
 }
@@ -1504,12 +1518,34 @@ async fn handle_shutdown(
 mod tests {
     use super::*;
     use pilotty_core::error::ErrorCode;
-    use pilotty_core::protocol::{Command, PROTOCOL_VERSION};
+    use pilotty_core::protocol::{Command, SessionStatus, PROTOCOL_VERSION};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::UnixStream;
     use tokio::time::timeout;
     use uuid::Uuid;
+
+    async fn socket_request(
+        reader: &mut BufReader<OwnedReadHalf>,
+        writer: &mut OwnedWriteHalf,
+        request: Request,
+    ) -> Response {
+        writer
+            .write_all(
+                serde_json::to_string(&request)
+                    .expect("serialize request")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write request");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.flush().await.expect("flush request");
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        serde_json::from_str(&line).expect("parse response")
+    }
 
     #[test]
     fn retention_environment_value_is_validated() {
@@ -1540,6 +1576,111 @@ mod tests {
             response.error.map(|error| error.code),
             Some(ErrorCode::InvalidInput)
         ));
+    }
+
+    #[tokio::test]
+    async fn status_reports_live_then_successful_exit_over_the_socket() {
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/pilotty-status-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let pid_path = socket_path.with_extension("pid");
+        let server = DaemonServer::bind_to(socket_path.clone(), pid_path)
+            .await
+            .expect("bind server");
+        let server_handle = tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(4), server.run()).await;
+        });
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to server");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        let spawn = socket_request(
+            &mut reader,
+            &mut writer,
+            Request::new(
+                "spawn-status",
+                Command::Spawn {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf status-evidence; sleep 1; exit 0".to_string(),
+                    ],
+                    session_name: Some("socket-status".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    retain_bytes: Some(8),
+                },
+            ),
+        )
+        .await;
+        assert!(spawn.success);
+
+        let running = socket_request(
+            &mut reader,
+            &mut writer,
+            Request::new(
+                "running-status",
+                Command::Status {
+                    session: Some("socket-status".to_string()),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            running.data,
+            Some(ResponseData::Status(SessionStatus::Running {
+                cwd: Some(cwd),
+                size: TerminalSize { cols: 80, rows: 24 },
+                ..
+            })) if cwd == "/tmp"
+        ));
+
+        let exited = timeout(Duration::from_secs(3), async {
+            loop {
+                let response = socket_request(
+                    &mut reader,
+                    &mut writer,
+                    Request::new(
+                        Uuid::new_v4().to_string(),
+                        Command::Status {
+                            session: Some("socket-status".to_string()),
+                        },
+                    ),
+                )
+                .await;
+                if matches!(
+                    &response.data,
+                    Some(ResponseData::Status(SessionStatus::Exited { .. }))
+                ) {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("finalized status");
+
+        assert!(matches!(
+            exited.data,
+            Some(ResponseData::Status(SessionStatus::Exited {
+                exit_code: Some(0),
+                success: true,
+                killed_by_client: false,
+                output_complete: true,
+                retention: pilotty_core::protocol::RetentionAccounting {
+                    total_bytes: 15,
+                    retained_bytes: 8,
+                    dropped_bytes: 7,
+                    truncated: true,
+                },
+                ..
+            }))
+        ));
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[tokio::test]
