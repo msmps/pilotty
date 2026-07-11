@@ -400,15 +400,18 @@ impl SessionManager {
         let cursor_visible = terminal.cursor_visible();
         let size = session.size;
 
-        // Detect UI elements and compute content hash if requested
-        let (elements, content_hash) = if with_elements {
+        // The hash must be computed even when elements are not requested:
+        // the await_change/settle wait loops poll with `with_elements = false`
+        // and compare this hash to detect screen changes.
+        let content_hash = Some(compute_content_hash(&text));
+
+        // Detect UI elements if requested
+        let elements = if with_elements {
             let (cursor_row, cursor_col) = cursor_pos;
             let ctx = ClassifyContext::new().with_cursor(cursor_row, cursor_col);
-            let elems = detect(&*terminal, &ctx);
-            let hash = compute_content_hash(&text);
-            (Some(elems), Some(hash))
+            Some(detect(&*terminal, &ctx))
         } else {
-            (None, None)
+            None
         };
 
         Ok(SnapshotData {
