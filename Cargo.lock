@@ -491,7 +491,6 @@ version = "0.0.10"
 dependencies = [
  "serde",
  "serde_json",
- "unicode-width",
 ]
 
 [[package]]

@@ -1,7 +1,6 @@
 //! Session manager for tracking active PTY sessions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,8 +10,6 @@ use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
-use pilotty_core::elements::classify::{detect, ClassifyContext};
-use pilotty_core::elements::Element;
 use pilotty_core::error::ApiError;
 use pilotty_core::protocol::{RetentionAccounting, SessionInfo, SessionStatus};
 use pilotty_core::snapshot::{compute_content_hash, CursorState, ScreenState, TerminalSize};
@@ -66,8 +63,6 @@ pub(crate) struct SnapshotData {
     pub(crate) cursor_pos: (u16, u16),
     pub(crate) cursor_visible: bool,
     pub(crate) size: TermSize,
-    /// Detected UI elements (computed on demand).
-    pub(crate) elements: Option<Vec<Element>>,
     /// Hash of screen content for change detection.
     pub(crate) content_hash: u64,
     /// Revision matching this exact screen state.
@@ -207,18 +202,11 @@ impl Session {
         self.pty.write(data).await
     }
 
-    async fn snapshot(&self, with_elements: bool) -> SnapshotData {
+    async fn snapshot(&self) -> SnapshotData {
         let terminal = self.observed_terminal.lock().await;
         let text = terminal.emulator.get_text();
         let cursor_pos = terminal.emulator.cursor_position();
         let cursor_visible = terminal.emulator.cursor_visible();
-        let elements = if with_elements {
-            let (cursor_row, cursor_col) = cursor_pos;
-            let context = ClassifyContext::new().with_cursor(cursor_row, cursor_col);
-            Some(detect(&terminal.emulator, &context))
-        } else {
-            None
-        };
 
         SnapshotData {
             content_hash: compute_content_hash(&text),
@@ -226,7 +214,6 @@ impl Session {
             cursor_pos,
             cursor_visible,
             size: terminal.size,
-            elements,
             revision: terminal.revision,
         }
     }
@@ -292,13 +279,8 @@ impl Session {
         output_complete
     }
 
-    async fn final_tombstone(
-        &self,
-        snapshot_id: u64,
-        output_complete: bool,
-        killed_by_client: bool,
-    ) -> Tombstone {
-        let snapshot = self.snapshot(true).await;
+    async fn final_tombstone(&self, output_complete: bool, killed_by_client: bool) -> Tombstone {
+        let snapshot = self.snapshot().await;
         let output = self
             .retention
             .lock()
@@ -336,7 +318,6 @@ impl Session {
             exit,
             output_complete,
             final_screen: ScreenState {
-                snapshot_id,
                 size: TerminalSize {
                     cols: snapshot.size.cols,
                     rows: snapshot.size.rows,
@@ -347,7 +328,6 @@ impl Session {
                     visible: snapshot.cursor_visible,
                 },
                 text: Some(snapshot.text),
-                elements: snapshot.elements,
                 content_hash: Some(snapshot.content_hash),
             },
             output,
@@ -379,11 +359,11 @@ pub(crate) enum SessionEvidence {
 impl SessionObserver {
     /// Capture the current screen after marking the current pump state as observed.
     /// Output arriving after that mark remains visible to `wait_for_update`.
-    pub(crate) async fn current(&mut self, with_elements: bool) -> SnapshotData {
+    pub(crate) async fn current(&mut self) -> SnapshotData {
         {
             let _state = self.pump_state.borrow_and_update();
         }
-        self.session.snapshot(with_elements).await
+        self.session.snapshot().await
     }
 
     /// Inspect the direct child without treating PTY EOF as process exit.
@@ -493,8 +473,6 @@ pub struct SessionManager {
     sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
     tombstones: Mutex<TombstoneStore>,
     default_retain_bytes: usize,
-    /// Global snapshot counter for unique snapshot IDs.
-    snapshot_counter: AtomicU64,
 }
 
 impl Default for SessionManager {
@@ -515,15 +493,7 @@ impl SessionManager {
             sessions: RwLock::new(HashMap::new()),
             tombstones: Mutex::new(TombstoneStore::new(TOMBSTONE_CAPACITY, TOMBSTONE_TTL)),
             default_retain_bytes,
-            snapshot_counter: AtomicU64::new(1),
         }
-    }
-
-    /// Get the next snapshot ID (incrementing counter).
-    ///
-    /// Uses Relaxed ordering since snapshot IDs only need uniqueness, not global ordering.
-    pub fn next_snapshot_id(&self) -> u64 {
-        self.snapshot_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Create a new session by spawning a PTY.
@@ -661,9 +631,7 @@ impl SessionManager {
             .remove(id)
             .ok_or_else(|| ApiError::session_not_found(&id.0))?;
         let output_complete = session.shutdown().await;
-        let tombstone = session
-            .final_tombstone(self.next_snapshot_id(), output_complete, true)
-            .await;
+        let tombstone = session.final_tombstone(output_complete, true).await;
         self.tombstones
             .lock()
             .await
@@ -924,9 +892,7 @@ impl SessionManager {
 
                 for (id, session, output_complete) in finalizing_sessions {
                     session.finish_pump(output_complete).await;
-                    let tombstone = session
-                        .final_tombstone(manager.next_snapshot_id(), output_complete, false)
-                        .await;
+                    let tombstone = session.final_tombstone(output_complete, false).await;
                     let mut tombstones = manager.tombstones.lock().await;
                     let mut sessions = manager.sessions.write().await;
                     let is_same_session = sessions
@@ -1369,7 +1335,7 @@ mod tests {
             .observe_session(&id)
             .await
             .expect("subscribe to session observations");
-        let baseline = observer.current(false).await;
+        let baseline = observer.current().await;
 
         manager
             .write_to_session(&id, b"observer-marker\n")
@@ -1380,7 +1346,7 @@ mod tests {
             observer.wait_for_update(Duration::from_secs(1)).await,
             ObservationEvent::Updated
         );
-        let changed = observer.current(false).await;
+        let changed = observer.current().await;
         assert_ne!(changed.content_hash, baseline.content_hash);
         assert!(changed.revision > baseline.revision);
         assert!(changed.text.contains("observer-marker"));
@@ -1407,13 +1373,13 @@ mod tests {
             .await
             .expect("subscribe to session observations");
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let baseline = observer.current(false).await;
+        let baseline = observer.current().await;
 
         assert_eq!(
             observer.wait_for_update(Duration::from_secs(1)).await,
             ObservationEvent::Updated
         );
-        let changed = observer.current(false).await;
+        let changed = observer.current().await;
         assert!(changed.revision > baseline.revision);
         assert_eq!(changed.content_hash, baseline.content_hash);
 
@@ -1449,7 +1415,7 @@ mod tests {
             }
         }
 
-        let final_screen = observer.current(false).await;
+        let final_screen = observer.current().await;
         assert!(final_screen.text.contains("final-screen-sentinel"));
         manager.kill_session(&id).await.expect("remove session");
     }

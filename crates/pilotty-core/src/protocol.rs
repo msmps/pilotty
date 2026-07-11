@@ -19,11 +19,14 @@ pub const PROTOCOL_V1: u32 = 1;
 /// Bounded retention and finalized-session evidence introduced for v0.0.9.
 pub const PROTOCOL_V2: u32 = 2;
 
+/// Minimal text-and-cursor screen snapshots.
+pub const PROTOCOL_V3: u32 = 3;
+
 /// Current daemon protocol advertised on every request and response.
 ///
 /// Historical minimum-version mappings below must use the stable version
 /// constants, not this moving alias.
-pub const PROTOCOL_VERSION: u32 = PROTOCOL_V2;
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_V3;
 
 /// Whether an observed peer protocol satisfies a wire variant's requirement.
 pub fn supports_protocol(observed: u32, required: u32) -> bool {
@@ -171,9 +174,9 @@ impl Command {
                 retain_bytes: Some(_),
                 ..
             }
-            | Self::Snapshot { .. }
             | Self::Output { .. }
             | Self::Status { .. } => PROTOCOL_V2,
+            Self::Snapshot { .. } => PROTOCOL_V3,
             Self::Spawn {
                 retain_bytes: None, ..
             }
@@ -194,10 +197,10 @@ impl Command {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotFormat {
-    /// Full JSON with all metadata including text and elements.
+    /// Full JSON with screen text and content hash.
     #[default]
     Full,
-    /// Compact format: omits text and elements, just metadata.
+    /// Compact format: omits text and content hash, just metadata.
     Compact,
     /// Plain text only (no JSON structure).
     Text,
@@ -351,10 +354,8 @@ impl ResponseData {
     /// older client.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
-            Self::ScreenState(_)
-            | Self::Snapshot { .. }
-            | Self::Output { .. }
-            | Self::Status(_) => PROTOCOL_V2,
+            Self::ScreenState(_) | Self::Snapshot { .. } => PROTOCOL_V3,
+            Self::Output { .. } | Self::Status(_) => PROTOCOL_V2,
             Self::SessionCreated { .. }
             | Self::Sessions { .. }
             | Self::WaitForResult { .. }
@@ -429,7 +430,7 @@ mod tests {
     fn request_serializes_with_protocol_version() {
         let request = Request::new("req-1", Command::ListSessions);
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"protocol\":2"), "got: {json}");
+        assert!(json.contains("\"protocol\":3"), "got: {json}");
     }
 
     #[test]
@@ -446,9 +447,9 @@ mod tests {
         // A current client's request must still parse if a field is unknown
         // to the receiver; serde ignores unknown fields by default. Guard
         // against someone adding deny_unknown_fields later.
-        let json = r#"{"id":"req-1","command":{"action":"list_sessions"},"protocol":2,"future_field":true}"#;
+        let json = r#"{"id":"req-1","command":{"action":"list_sessions"},"protocol":3,"future_field":true}"#;
         let request: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(request.protocol, PROTOCOL_V2);
+        assert_eq!(request.protocol, PROTOCOL_V3);
     }
 
     #[test]
@@ -502,6 +503,9 @@ mod tests {
         assert!(supports_protocol(PROTOCOL_V2, PROTOCOL_V1));
         assert!(supports_protocol(PROTOCOL_V2, PROTOCOL_V2));
         assert!(!supports_protocol(PROTOCOL_V1, PROTOCOL_V2));
+        assert!(supports_protocol(PROTOCOL_V3, PROTOCOL_V2));
+        assert!(supports_protocol(PROTOCOL_V3, PROTOCOL_V3));
+        assert!(!supports_protocol(PROTOCOL_V2, PROTOCOL_V3));
     }
 
     #[test]
@@ -560,7 +564,7 @@ mod tests {
 
         assert_eq!(plain_spawn.minimum_protocol(), LEGACY_PROTOCOL_VERSION);
         assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_V2);
-        assert_eq!(outcome_snapshot.minimum_protocol(), PROTOCOL_V2);
+        assert_eq!(outcome_snapshot.minimum_protocol(), PROTOCOL_V3);
         assert_eq!(
             Command::Output {
                 session: None,
@@ -585,11 +589,10 @@ mod tests {
             note: Some("Screen kept changing".to_string()),
         });
 
-        assert_eq!(response.minimum_protocol(), PROTOCOL_V2);
+        assert_eq!(response.minimum_protocol(), PROTOCOL_V3);
         let json = serde_json::to_string(&response).expect("serialize capture outcome");
         assert!(json.contains("\"type\":\"screen_state\""), "got: {json}");
         assert!(json.contains("\"outcome\":\"deadline\""), "got: {json}");
-        assert!(json.contains("\"snapshot_id\":0"), "got: {json}");
         assert!(!json.contains("\"screen\""), "got: {json}");
 
         let decoded: ResponseData =

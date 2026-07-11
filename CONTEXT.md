@@ -38,12 +38,8 @@ _Avoid_: truncated (reserved for retention-ring capacity loss)
 ### Observation
 
 **Snapshot**:
-A point-in-time capture of a session's current screen, optionally with detected elements.
+A point-in-time capture of a session's current screen text, cursor, and dimensions.
 _Avoid_: frame, capture (as a noun)
-
-**Element**:
-A UI control detected on the screen (button, input, toggle) with its position and label.
-_Avoid_: widget, component
 
 **Revision**:
 A monotonic per-session counter that advances whenever screen state may have changed;
