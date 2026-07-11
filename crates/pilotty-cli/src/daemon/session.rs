@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, RwLock};
+use portable_pty::ExitStatus;
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 use pilotty_core::elements::classify::{detect, ClassifyContext};
@@ -53,41 +55,104 @@ impl From<&str> for SessionId {
     }
 }
 
-/// Snapshot data returned from `SessionManager::get_snapshot_data`.
-pub struct SnapshotData {
-    pub text: String,
-    pub cursor_pos: (u16, u16),
-    pub cursor_visible: bool,
-    pub size: TermSize,
+/// Atomically observed screen data for a session.
+pub(crate) struct SnapshotData {
+    pub(crate) text: String,
+    pub(crate) cursor_pos: (u16, u16),
+    pub(crate) cursor_visible: bool,
+    pub(crate) size: TermSize,
     /// Detected UI elements (computed on demand).
-    pub elements: Option<Vec<Element>>,
+    pub(crate) elements: Option<Vec<Element>>,
     /// Hash of screen content for change detection.
-    /// Present when `with_elements=true`.
-    pub content_hash: Option<u64>,
+    pub(crate) content_hash: u64,
+    /// Revision matching this exact screen state.
+    pub(crate) revision: u64,
+}
+
+/// Latest state published by a session's output pump.
+#[derive(Debug, Clone, Copy)]
+struct PumpState {
+    revision: u64,
+    last_output_at: Instant,
+    output_closed: bool,
+}
+
+/// Terminal state whose content and revision are captured atomically.
+struct ObservedTerminal {
+    emulator: TerminalEmulator,
+    revision: u64,
+    size: TermSize,
+}
+
+/// Owned pump task that cannot detach when its session is dropped.
+struct PumpTask {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PumpTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn abort_and_wait(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                debug!("Output pump failed during shutdown: {}", error);
+            }
+        }
+    }
+
+    async fn wait(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if let Err(error) = handle.await {
+            debug!("Output pump failed: {}", error);
+        }
+    }
+}
+
+impl Drop for PumpTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// An active PTY session.
-pub struct Session {
+struct Session {
     /// Unique session ID.
-    pub id: SessionId,
+    id: SessionId,
     /// Optional human-readable name.
-    pub name: Option<String>,
+    name: Option<String>,
     /// Command that was spawned.
-    pub command: Vec<String>,
+    command: Vec<String>,
     /// When the session was created.
-    pub created_at: DateTime<Utc>,
-    /// Terminal size.
-    pub size: TermSize,
+    created_at: DateTime<Utc>,
     /// Async handle for PTY I/O.
-    pub pty: AsyncPtyHandle,
-    /// Terminal emulator tracking screen state.
-    /// Wrapped in Mutex for interior mutability (fed by PTY reader task).
-    pub terminal: Arc<Mutex<TerminalEmulator>>,
+    pty: AsyncPtyHandle,
+    observed_terminal: Arc<Mutex<ObservedTerminal>>,
+    pump_state: watch::Receiver<PumpState>,
+    pump_task: Mutex<PumpTask>,
+    process_exit: std::sync::Mutex<Option<ProcessExit>>,
+}
+
+#[derive(Clone)]
+struct ProcessExit {
+    status: ExitStatus,
+    observed_at: Instant,
 }
 
 impl Session {
     /// Get session info for protocol responses.
-    pub fn info(&self) -> SessionInfo {
+    fn info(&self) -> SessionInfo {
         SessionInfo {
             id: self.id.0.clone(),
             name: self.name.clone(),
@@ -97,75 +162,205 @@ impl Session {
     }
 
     /// Check if terminal is in application cursor mode.
-    pub async fn application_cursor(&self) -> bool {
-        self.terminal.lock().await.application_cursor()
+    async fn application_cursor(&self) -> bool {
+        self.observed_terminal
+            .lock()
+            .await
+            .emulator
+            .application_cursor()
     }
 
     /// Write bytes to the PTY (send input to the terminal).
-    pub async fn write(&self, data: &[u8]) -> anyhow::Result<()> {
+    async fn write(&self, data: &[u8]) -> anyhow::Result<()> {
         self.pty.write(data).await
     }
 
-    /// Drain pending PTY output and feed to terminal emulator.
-    ///
-    /// Call this before taking a snapshot to ensure screen state is current.
-    ///
-    /// To prevent blocking on noisy processes, this has limits:
-    /// - Maximum 100 iterations (reads)
-    /// - Maximum 1MB total data
-    /// - 10ms timeout per read
-    ///
-    /// These limits ensure the drain completes quickly even with high-output processes.
-    pub async fn drain_pty_output(&self) {
-        use std::time::Duration;
-        use tokio::time::timeout;
+    async fn snapshot(&self, with_elements: bool) -> SnapshotData {
+        let terminal = self.observed_terminal.lock().await;
+        let text = terminal.emulator.get_text();
+        let cursor_pos = terminal.emulator.cursor_position();
+        let cursor_visible = terminal.emulator.cursor_visible();
+        let elements = if with_elements {
+            let (cursor_row, cursor_col) = cursor_pos;
+            let context = ClassifyContext::new().with_cursor(cursor_row, cursor_col);
+            Some(detect(&terminal.emulator, &context))
+        } else {
+            None
+        };
 
-        // Limits to prevent blocking on noisy processes
-        const MAX_ITERATIONS: usize = 100;
-        const MAX_BYTES: usize = 1024 * 1024; // 1 MB
+        SnapshotData {
+            content_hash: compute_content_hash(&text),
+            text,
+            cursor_pos,
+            cursor_visible,
+            size: terminal.size,
+            elements,
+            revision: terminal.revision,
+        }
+    }
 
-        let mut terminal = self.terminal.lock().await;
-        let mut iterations = 0;
-        let mut total_bytes = 0;
+    fn pump_state(&self) -> PumpState {
+        *self.pump_state.borrow()
+    }
 
-        // Read available data from PTY (non-blocking via short timeout)
-        loop {
-            if iterations >= MAX_ITERATIONS {
-                debug!(
-                    "Drain hit iteration limit ({} iterations, {} bytes)",
-                    iterations, total_bytes
-                );
-                break;
+    fn observe_process_exit(&self) -> anyhow::Result<Option<ProcessExit>> {
+        let mut process_exit = self
+            .process_exit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Process exit mutex poisoned"))?;
+        if let Some(exit) = process_exit.as_ref() {
+            return Ok(Some(exit.clone()));
+        }
+
+        let Some(status) = self.pty.exit_status()? else {
+            return Ok(None);
+        };
+        let exit = ProcessExit {
+            status,
+            observed_at: Instant::now(),
+        };
+        *process_exit = Some(exit.clone());
+        Ok(Some(exit))
+    }
+
+    async fn finish_pump(&self, output_complete: bool) {
+        let mut pump_task = self.pump_task.lock().await;
+        if output_complete {
+            pump_task.wait().await;
+        } else {
+            pump_task.abort_and_wait().await;
+        }
+    }
+
+    async fn wait_for_output_close(&self) -> bool {
+        let mut pump_state = self.pump_state.clone();
+        if pump_state.borrow().output_closed {
+            return true;
+        }
+
+        tokio::time::timeout(EXIT_DRAIN_TIMEOUT, async move {
+            loop {
+                if pump_state.changed().await.is_err() {
+                    return pump_state.borrow().output_closed;
+                }
+                if pump_state.borrow_and_update().output_closed {
+                    return true;
+                }
             }
+        })
+        .await
+        .unwrap_or(false)
+    }
 
-            match timeout(Duration::from_millis(10), self.pty.read()).await {
-                Ok(Some(data)) => {
-                    let len = data.len();
-                    debug!("Fed {} bytes to terminal emulator", len);
-                    terminal.feed(&data);
+    async fn shutdown(&self) {
+        self.pty.terminate();
+        let output_complete = self.wait_for_output_close().await;
+        self.finish_pump(output_complete).await;
+    }
+}
 
-                    iterations += 1;
-                    total_bytes += len;
+/// Result of waiting for a session observation without exposing watch semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationEvent {
+    Updated,
+    OutputClosed,
+    Deadline,
+    PumpFailed,
+}
 
-                    if total_bytes >= MAX_BYTES {
-                        debug!(
-                            "Drain hit byte limit ({} iterations, {} bytes)",
-                            iterations, total_bytes
-                        );
-                        break;
-                    }
+/// Subscription to one session's atomically observed terminal state.
+pub(crate) struct SessionObserver {
+    session: Arc<Session>,
+    pump_state: watch::Receiver<PumpState>,
+}
+
+impl SessionObserver {
+    /// Capture the current screen after marking the current pump state as observed.
+    /// Output arriving after that mark remains visible to `wait_for_update`.
+    pub(crate) async fn current(&mut self, with_elements: bool) -> SnapshotData {
+        {
+            let _state = self.pump_state.borrow_and_update();
+        }
+        self.session.snapshot(with_elements).await
+    }
+
+    /// Wait for output, EOF, pump failure, or the supplied duration.
+    pub(crate) async fn wait_for_update(&mut self, duration: Duration) -> ObservationEvent {
+        match tokio::time::timeout(duration, self.pump_state.changed()).await {
+            Err(_) => ObservationEvent::Deadline,
+            Ok(Ok(())) => {
+                if self.pump_state.borrow().output_closed {
+                    ObservationEvent::OutputClosed
+                } else {
+                    ObservationEvent::Updated
                 }
-                Ok(None) => {
-                    // PTY closed
-                    debug!("PTY channel closed");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - no more data available
-                    break;
+            }
+            Ok(Err(_)) => {
+                if self.pump_state.borrow().output_closed {
+                    ObservationEvent::OutputClosed
+                } else {
+                    ObservationEvent::PumpFailed
                 }
             }
         }
+    }
+}
+
+const MAX_PUMP_BATCH_BYTES: usize = 1024 * 1024;
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn run_output_pump(
+    mut read_rx: mpsc::Receiver<Vec<u8>>,
+    observed_terminal: Arc<Mutex<ObservedTerminal>>,
+    state_tx: watch::Sender<PumpState>,
+) {
+    let mut pending = None;
+    let mut last_output_at = Instant::now();
+
+    loop {
+        let first = match pending.take() {
+            Some(data) => data,
+            None => match read_rx.recv().await {
+                Some(data) => data,
+                None => {
+                    let revision = observed_terminal.lock().await.revision;
+                    state_tx.send_replace(PumpState {
+                        revision,
+                        last_output_at,
+                        output_closed: true,
+                    });
+                    return;
+                }
+            },
+        };
+
+        let mut batch = first;
+        while batch.len() < MAX_PUMP_BATCH_BYTES {
+            match read_rx.try_recv() {
+                Ok(data) if batch.len() + data.len() <= MAX_PUMP_BATCH_BYTES => {
+                    batch.extend_from_slice(&data);
+                }
+                Ok(data) => {
+                    pending = Some(data);
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let revision = {
+            let mut terminal = observed_terminal.lock().await;
+            terminal.emulator.feed(&batch);
+            terminal.revision = terminal.revision.saturating_add(1);
+            terminal.revision
+        };
+        last_output_at = Instant::now();
+        state_tx.send_replace(PumpState {
+            revision,
+            last_output_at,
+            output_closed: false,
+        });
     }
 }
 
@@ -176,7 +371,7 @@ const MAX_SESSIONS: usize = 100;
 ///
 /// Thread-safe via interior mutability with RwLock.
 pub struct SessionManager {
-    sessions: RwLock<HashMap<SessionId, Session>>,
+    sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
     /// Global snapshot counter for unique snapshot IDs.
     snapshot_counter: AtomicU64,
 }
@@ -239,36 +434,52 @@ impl SessionManager {
 
         // Spawn the PTY session
         let pty_session = PtySession::spawn(&command, size, cwd.as_deref())
-            .map_err(|e| ApiError::spawn_failed(&command, &e.to_string()))?;
+            .map_err(|error| ApiError::spawn_failed(&command, &format!("{error:#}")))?;
 
-        // Wrap in async handle
-        let pty = AsyncPtyHandle::new(pty_session)
-            .map_err(|e| ApiError::spawn_failed(&command, &e.to_string()))?;
+        // Wrap in async handle and transfer sole output ownership to the pump.
+        let (pty, read_rx) = AsyncPtyHandle::new(pty_session)
+            .map_err(|error| ApiError::spawn_failed(&command, &format!("{error:#}")))?;
 
-        // Create terminal emulator to track screen state
-        let terminal = Arc::new(Mutex::new(TerminalEmulator::new(size)));
+        let observed_terminal = Arc::new(Mutex::new(ObservedTerminal {
+            emulator: TerminalEmulator::new(size),
+            revision: 0,
+            size,
+        }));
+        let initial_pump_state = PumpState {
+            revision: 0,
+            last_output_at: Instant::now(),
+            output_closed: false,
+        };
+        let (pump_state_tx, pump_state) = watch::channel(initial_pump_state);
+        let pump_handle = tokio::spawn(run_output_pump(
+            read_rx,
+            observed_terminal.clone(),
+            pump_state_tx,
+        ));
 
         let id = SessionId::new();
-        let session = Session {
+        let session = Arc::new(Session {
             id: id.clone(),
             name,
             command,
             created_at: Utc::now(),
-            size,
             pty,
-            terminal,
-        };
+            observed_terminal,
+            pump_state,
+            pump_task: Mutex::new(PumpTask::new(pump_handle)),
+            process_exit: std::sync::Mutex::new(None),
+        });
 
         let mut sessions = self.sessions.write().await;
         if sessions.len() >= MAX_SESSIONS {
             drop(sessions);
-            session.pty.shutdown().await;
+            session.shutdown().await;
             return Err(ApiError::session_limit_reached(MAX_SESSIONS));
         }
         if let Some(ref n) = session.name {
             if sessions.values().any(|s| s.name.as_deref() == Some(n)) {
                 drop(sessions);
-                session.pty.shutdown().await;
+                session.shutdown().await;
                 return Err(ApiError::duplicate_session_name(n));
             }
         }
@@ -281,7 +492,7 @@ impl SessionManager {
     ///
     /// Returns an error if the session doesn't exist.
     #[cfg(test)]
-    pub async fn get_session<F, R>(&self, id: &SessionId, f: F) -> Result<R, ApiError>
+    async fn get_session<F, R>(&self, id: &SessionId, f: F) -> Result<R, ApiError>
     where
         F: FnOnce(&Session) -> R,
     {
@@ -296,15 +507,14 @@ impl SessionManager {
     ///
     /// Returns an error if the session doesn't exist.
     pub async fn kill_session(&self, id: &SessionId) -> Result<(), ApiError> {
-        let mut sessions = self.sessions.write().await;
-        match sessions.remove(id) {
-            Some(session) => {
-                // Shutdown the async PTY handle (drops writer, signals reader to stop)
-                session.pty.shutdown().await;
-                Ok(())
-            }
-            None => Err(ApiError::session_not_found(&id.0)),
-        }
+        let session = self
+            .sessions
+            .write()
+            .await
+            .remove(id)
+            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
+        session.shutdown().await;
+        Ok(())
     }
 
     /// List all active sessions.
@@ -369,67 +579,9 @@ impl SessionManager {
         }
     }
 
-    /// Get snapshot data for a session.
-    ///
-    /// Drains pending PTY output to terminal emulator before capturing snapshot.
-    ///
-    /// Uses a read lock on sessions since all operations use interior mutability,
-    /// avoiding potential deadlocks from holding a write lock during I/O.
-    ///
-    /// If `with_elements` is true, element detection runs to identify
-    /// UI elements like buttons, checkboxes, and menu items.
-    pub async fn get_snapshot_data(
-        &self,
-        id: &SessionId,
-        with_elements: bool,
-    ) -> Result<SnapshotData, ApiError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
-
-        // Drain pending PTY output to update terminal state
-        session.drain_pty_output().await;
-
-        // Lock terminal once for all reads
-        let terminal = session.terminal.lock().await;
-
-        // Get snapshot data
-        let text = terminal.get_text();
-        let cursor_pos = terminal.cursor_position();
-        let cursor_visible = terminal.cursor_visible();
-        let size = session.size;
-
-        // The hash must be computed even when elements are not requested:
-        // the await_change/settle wait loops poll with `with_elements = false`
-        // and compare this hash to detect screen changes.
-        let content_hash = Some(compute_content_hash(&text));
-
-        // Detect UI elements if requested
-        let elements = if with_elements {
-            let (cursor_row, cursor_col) = cursor_pos;
-            let ctx = ClassifyContext::new().with_cursor(cursor_row, cursor_col);
-            Some(detect(&*terminal, &ctx))
-        } else {
-            None
-        };
-
-        Ok(SnapshotData {
-            text,
-            cursor_pos,
-            cursor_visible,
-            size,
-            elements,
-            content_hash,
-        })
-    }
-
     /// Write bytes to a session's PTY.
     pub async fn write_to_session(&self, id: &SessionId, data: &[u8]) -> Result<(), ApiError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
+        let session = self.session(id).await?;
 
         session
             .write(data)
@@ -446,10 +598,7 @@ impl SessionManager {
         cols: u16,
         rows: u16,
     ) -> Result<(), ApiError> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
+        let session = self.session(id).await?;
 
         let new_size = TermSize { cols, rows };
 
@@ -459,37 +608,48 @@ impl SessionManager {
             .resize(new_size)
             .map_err(|e| ApiError::command_failed(format!("Failed to resize PTY: {}", e)))?;
 
-        // Update session's stored size
-        session.size = new_size;
-
-        // Resize the terminal emulator
-        session.terminal.lock().await.resize(new_size);
+        let mut terminal = session.observed_terminal.lock().await;
+        terminal.size = new_size;
+        terminal.emulator.resize(new_size);
 
         Ok(())
     }
 
     /// Get terminal size for a session.
     pub async fn get_terminal_size(&self, id: &SessionId) -> Result<TermSize, ApiError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
-        Ok(session.size)
+        let session = self.session(id).await?;
+        let size = session.observed_terminal.lock().await.size;
+        Ok(size)
     }
 
     /// Get the application cursor mode for a session.
     ///
-    /// Drains pending PTY output first to ensure mode is current.
+    /// The output pump keeps this mode current.
     /// When true, arrow keys should send SS3 sequences instead of CSI.
     pub async fn get_application_cursor_mode(&self, id: &SessionId) -> Result<bool, ApiError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(id)
-            .ok_or_else(|| ApiError::session_not_found(&id.0))?;
-
-        // Drain to get current terminal state
-        session.drain_pty_output().await;
+        let session = self.session(id).await?;
         Ok(session.application_cursor().await)
+    }
+
+    async fn session(&self, id: &SessionId) -> Result<Arc<Session>, ApiError> {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ApiError::session_not_found(&id.0))
+    }
+
+    /// Subscribe to screen observations for a live session.
+    pub(crate) async fn observe_session(
+        &self,
+        id: &SessionId,
+    ) -> Result<SessionObserver, ApiError> {
+        let session = self.session(id).await?;
+        Ok(SessionObserver {
+            pump_state: session.pump_state.clone(),
+            session,
+        })
     }
 
     /// Spawn a background task that cleans up dead sessions.
@@ -514,37 +674,65 @@ impl SessionManager {
                     break;
                 };
 
-                // Collect IDs of sessions with dead processes
-                let dead_sessions: Vec<SessionId> = {
+                // Collect sessions ready to finalize. A direct-process exit starts a
+                // bounded drain so a descendant cannot keep the session live forever.
+                let finalizing_sessions: Vec<(SessionId, Arc<Session>, bool)> = {
                     let sessions = manager.sessions.read().await;
                     sessions
                         .iter()
                         .filter_map(|(id, session)| {
-                            // Check if child process has exited
-                            if session.pty.has_exited().unwrap_or(false) {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
+                            let process_exit = match session.observe_process_exit() {
+                                Ok(exit) => exit,
+                                Err(error) => {
+                                    debug!("Failed to inspect session {}: {}", id, error);
+                                    return None;
+                                }
+                            };
+                            let exit = process_exit?;
+                            let pump_state = session.pump_state();
+                            let output_closed = pump_state.output_closed;
+                            let drain_expired = exit.observed_at.elapsed() >= EXIT_DRAIN_TIMEOUT;
+                            debug!(
+                                "Exit observed for session {} at revision {}, last output {:?} ago",
+                                id,
+                                pump_state.revision,
+                                pump_state.last_output_at.elapsed()
+                            );
+                            (output_closed || drain_expired)
+                                .then(|| (id.clone(), session.clone(), output_closed))
                         })
                         .collect()
                 };
 
-                // Remove dead sessions
-                if !dead_sessions.is_empty() {
+                for (id, session, output_complete) in finalizing_sessions {
+                    session.finish_pump(output_complete).await;
                     let mut sessions = manager.sessions.write().await;
-                    for id in dead_sessions {
-                        if let Some(session) = sessions.remove(&id) {
-                            info!(
-                                "Cleaned up session {} ({:?}) - process exited",
-                                id,
-                                session.name.as_deref().unwrap_or("unnamed")
-                            );
-                        }
+                    let is_same_session = sessions
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &session));
+                    if is_same_session {
+                        sessions.remove(&id);
+                        info!(
+                            "Finalized session {} ({:?}), status: {}, output complete: {}",
+                            id,
+                            session.name.as_deref().unwrap_or("unnamed"),
+                            exit_status_description(&session),
+                            output_complete
+                        );
                     }
                 }
             }
         });
+    }
+}
+
+fn exit_status_description(session: &Session) -> String {
+    match session.process_exit.lock() {
+        Ok(exit) => exit
+            .as_ref()
+            .map(|exit| exit.status.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        Err(_) => "unavailable".to_string(),
     }
 }
 
@@ -875,6 +1063,200 @@ mod tests {
             1,
             "Live session should NOT be cleaned up"
         );
+    }
+
+    #[tokio::test]
+    async fn verbose_session_exits_without_snapshot_reads() {
+        let manager = Arc::new(SessionManager::new());
+
+        manager
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "yes output | head -c 1048576".to_string(),
+                ],
+                Some("verbose-session".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create verbose session");
+        manager.spawn_cleaner();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while manager.session_count().await != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("verbose session should exit without requiring snapshot reads");
+    }
+
+    #[tokio::test]
+    async fn observer_wakes_when_screen_output_arrives() {
+        let manager = SessionManager::new();
+        let id = manager
+            .create_session(
+                vec!["cat".to_string()],
+                Some("observed-session".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create observed session");
+        let mut observer = manager
+            .observe_session(&id)
+            .await
+            .expect("subscribe to session observations");
+        let baseline = observer.current(false).await;
+
+        manager
+            .write_to_session(&id, b"observer-marker\n")
+            .await
+            .expect("write marker");
+
+        assert_eq!(
+            observer.wait_for_update(Duration::from_secs(1)).await,
+            ObservationEvent::Updated
+        );
+        let changed = observer.current(false).await;
+        assert_ne!(changed.content_hash, baseline.content_hash);
+        assert!(changed.revision > baseline.revision);
+        assert!(changed.text.contains("observer-marker"));
+    }
+
+    #[tokio::test]
+    async fn invisible_output_advances_revision_without_changing_screen_hash() {
+        let manager = SessionManager::new();
+        let id = manager
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    r"while :; do printf '\033]0;title\007'; sleep 0.02; done".to_string(),
+                ],
+                Some("invisible-output".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create invisible-output session");
+        let mut observer = manager
+            .observe_session(&id)
+            .await
+            .expect("subscribe to session observations");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let baseline = observer.current(false).await;
+
+        assert_eq!(
+            observer.wait_for_update(Duration::from_secs(1)).await,
+            ObservationEvent::Updated
+        );
+        let changed = observer.current(false).await;
+        assert!(changed.revision > baseline.revision);
+        assert_eq!(changed.content_hash, baseline.content_hash);
+
+        manager.kill_session(&id).await.expect("kill session");
+    }
+
+    #[tokio::test]
+    async fn output_close_preserves_fast_process_final_screen() {
+        let manager = SessionManager::new();
+        let id = manager
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf final-screen-sentinel; exit 3".to_string(),
+                ],
+                Some("final-screen".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create fast-exit session");
+        let mut observer = manager
+            .observe_session(&id)
+            .await
+            .expect("subscribe to session observations");
+
+        loop {
+            match observer.wait_for_update(Duration::from_secs(1)).await {
+                ObservationEvent::Updated => {}
+                ObservationEvent::OutputClosed => break,
+                other => panic!("expected output close, got {other:?}"),
+            }
+        }
+
+        let final_screen = observer.current(false).await;
+        assert!(final_screen.text.contains("final-screen-sentinel"));
+        manager.kill_session(&id).await.expect("remove session");
+    }
+
+    #[tokio::test]
+    async fn kill_is_not_blocked_by_saturated_input_writers() {
+        let manager = Arc::new(SessionManager::new());
+        let id = manager
+            .create_session(
+                vec!["sleep".to_string(), "10".to_string()],
+                Some("blocked-writers".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create non-reading session");
+
+        let mut writers = Vec::new();
+        for _ in 0..96 {
+            let manager = manager.clone();
+            let id = id.clone();
+            writers.push(tokio::spawn(async move {
+                let data = b"input-line\n".repeat(8 * 1024);
+                manager.write_to_session(&id, &data).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), manager.kill_session(&id))
+            .await
+            .expect("kill must not wait for blocked input writers")
+            .expect("kill session");
+
+        for writer in writers {
+            let _write_result = tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .expect("input writer should stop after kill")
+                .expect("input writer task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn exited_session_finalizes_when_descendant_keeps_pty_open() {
+        let manager = Arc::new(SessionManager::new());
+
+        manager
+            .create_session(
+                vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    "import os,signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); pid=os.fork(); os._exit(7) if pid else time.sleep(3)".to_string(),
+                ],
+                Some("inherited-pty".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create session with descendant");
+        manager.spawn_cleaner();
+
+        tokio::time::timeout(Duration::from_millis(2500), async {
+            while manager.session_count().await != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an exited session must not stay live while a descendant holds the PTY open");
     }
 
     #[tokio::test]

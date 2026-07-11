@@ -24,6 +24,17 @@ _Avoid_: killed (reserve for explicit `kill`), dead
 An ended session whose tombstone is gone (TTL, eviction, or daemon restart);
 indistinguishable from never-existed.
 
+**Finalization**:
+The bounded transition from a live session to a tombstone: capture exit status, drain
+output to EOF or the deadline, capture final evidence, then stop the session runtime.
+_Avoid_: cleanup (too broad), reap (the cleaner's mechanism rather than the transition)
+
+**Output complete**:
+Whether the pump observed PTY EOF before finalization's drain deadline. False means the
+final evidence is truthful but may omit later output from a descendant that kept the PTY
+open.
+_Avoid_: truncated (reserved for retention-ring capacity loss)
+
 ### Observation
 
 **Snapshot**:

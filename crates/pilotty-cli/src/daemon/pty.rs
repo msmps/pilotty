@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
@@ -36,7 +36,6 @@ impl From<TermSize> for PtySize {
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    size: TermSize,
 }
 
 impl PtySession {
@@ -70,7 +69,6 @@ impl PtySession {
         Ok(Self {
             master: pair.master,
             child,
-            size,
         })
     }
 
@@ -87,11 +85,6 @@ impl PtySession {
             .take_writer()
             .context("Failed to take PTY writer")
     }
-    /// Get the current terminal size.
-    pub fn size(&self) -> TermSize {
-        self.size
-    }
-
     /// Consume the session and return the master PTY and child process.
     ///
     /// Used by AsyncPtyHandle to keep the master for resize operations
@@ -111,10 +104,6 @@ const READ_BUFFER_SIZE: usize = 4096;
 pub struct AsyncPtyHandle {
     /// Sender for writing to PTY stdin.
     write_tx: mpsc::Sender<Vec<u8>>,
-    /// Receiver for reading from PTY stdout.
-    /// Wrapped in Mutex for interior mutability so read() can take &self,
-    /// avoiding the need for &mut self which would require exclusive session access.
-    read_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Flag to signal shutdown.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Master PTY for resize operations (sends SIGWINCH).
@@ -123,9 +112,6 @@ pub struct AsyncPtyHandle {
     /// Child process handle for cleanup on shutdown.
     /// Wrapped in Mutex to allow killing from shutdown().
     child: std::sync::Mutex<Box<dyn Child + Send + Sync>>,
-    /// Current terminal size, updated on resize.
-    /// Wrapped in Mutex for interior mutability.
-    size: std::sync::Mutex<TermSize>,
     /// Handle to the reader thread for cleanup.
     reader_thread: Option<std::thread::JoinHandle<()>>,
     /// Handle to the writer thread for cleanup.
@@ -136,10 +122,9 @@ impl AsyncPtyHandle {
     /// Create async I/O channels for a PTY session.
     ///
     /// This spawns background threads for reading and writing to the PTY.
-    pub fn new(session: PtySession) -> Result<Self> {
+    pub fn new(session: PtySession) -> Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let reader = session.reader()?;
         let writer = session.writer()?;
-        let initial_size = session.size();
         let (master, child) = session.into_parts();
 
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -159,32 +144,27 @@ impl AsyncPtyHandle {
             Self::writer_loop(writer, write_rx);
         });
 
-        Ok(Self {
-            write_tx,
-            read_rx: tokio::sync::Mutex::new(read_rx),
-            shutdown,
-            master: std::sync::Mutex::new(master),
-            child: std::sync::Mutex::new(child),
-            size: std::sync::Mutex::new(initial_size),
-            reader_thread: Some(reader_thread),
-            writer_thread: Some(writer_thread),
-        })
+        Ok((
+            Self {
+                write_tx,
+                shutdown,
+                master: std::sync::Mutex::new(master),
+                child: std::sync::Mutex::new(child),
+                reader_thread: Some(reader_thread),
+                writer_thread: Some(writer_thread),
+            },
+            read_rx,
+        ))
     }
 
     /// Resize the PTY and send SIGWINCH to the child process.
     ///
-    /// Also updates the internal size tracking. Use `size()` to query.
     pub fn resize(&self, size: TermSize) -> Result<()> {
         self.master
             .lock()
             .map_err(|_| anyhow::anyhow!("Master PTY mutex poisoned"))?
             .resize(size.into())
             .context("Failed to resize PTY")?;
-        // Update tracked size
-        *self
-            .size
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Size mutex poisoned"))? = size;
         Ok(())
     }
     /// Send bytes to the PTY stdin.
@@ -195,30 +175,20 @@ impl AsyncPtyHandle {
             .context("Failed to send to PTY input channel")
     }
 
-    /// Receive bytes from the PTY stdout.
-    ///
-    /// Returns None if the PTY has closed.
-    pub async fn read(&self) -> Option<Vec<u8>> {
-        self.read_rx.lock().await.recv().await
-    }
-
-    /// Check if the child process has exited without blocking.
-    ///
-    /// Returns `Some(true)` if the process has exited, `Some(false)` if still running,
-    /// or `None` if the mutex is poisoned.
-    pub fn has_exited(&self) -> Option<bool> {
+    /// Return the child process exit status when it has exited.
+    pub fn exit_status(&self) -> Result<Option<ExitStatus>> {
         self.child
             .lock()
-            .ok()
-            .and_then(|mut child| child.try_wait().ok())
-            .map(|status| status.is_some())
+            .map_err(|_| anyhow::anyhow!("Child process mutex poisoned"))?
+            .try_wait()
+            .context("Failed to inspect child process status")
     }
 
-    /// Shutdown the async PTY I/O and terminate the child process.
+    /// Signal the I/O threads to stop and terminate the child process.
     ///
-    /// This kills the child process to prevent orphaned processes,
-    /// then signals the I/O threads to stop.
-    pub async fn shutdown(&self) {
+    /// The session runtime owns the read receiver and is responsible for ending its
+    /// pump before dropping this handle.
+    pub fn terminate(&self) {
         // Kill the child process first to prevent orphaned processes
         if let Ok(mut child) = self.child.lock() {
             if let Err(e) = child.kill() {
@@ -237,8 +207,6 @@ impl AsyncPtyHandle {
 
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Close the channels to unblock threads
-        self.read_rx.lock().await.close();
     }
 
     /// Reader loop running in a background thread.
@@ -317,18 +285,16 @@ impl Drop for AsyncPtyHandle {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        // Note: We intentionally don't block on join() here because:
+        // We intentionally don't block on join() here because:
         // 1. The reader thread may be blocked on a synchronous read() call
         //    which cannot be interrupted without closing the PTY fd
         // 2. The threads will terminate on their own when:
         //    - Reader: PTY closes (EOF) or channel is dropped
         //    - Writer: Channel closes when write_tx is dropped
         //
-        // The thread handles are stored so they're not detached (which would
-        // cause issues with thread-local storage), but we don't wait for them.
-        // This is acceptable because the threads don't hold any resources that
-        // need explicit cleanup - the channels and PTY handles are cleaned up
-        // by their own Drop implementations.
+        // Dropping a std thread handle detaches it. That is acceptable here because the
+        // threads own no state needed by callers; dropping the PTY and channel handles
+        // makes them terminate naturally.
 
         // Log if threads are still running (helpful for debugging)
         if let Some(ref handle) = self.reader_thread {
@@ -449,14 +415,15 @@ mod tests {
         let session = PtySession::spawn(&["bash".to_string()], TermSize::default(), None)
             .expect("Failed to spawn bash");
 
-        let handle = AsyncPtyHandle::new(session).expect("Failed to create async handle");
+        let (handle, mut read_rx) =
+            AsyncPtyHandle::new(session).expect("Failed to create async handle");
 
         // Give bash time to start and print prompt
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Drain any initial output (prompt, etc.)
         while let Ok(Some(_)) =
-            tokio::time::timeout(Duration::from_millis(100), handle.read()).await
+            tokio::time::timeout(Duration::from_millis(100), read_rx.recv()).await
         {
             // Keep reading until no more output
         }
@@ -470,7 +437,7 @@ mod tests {
         // The channel should close when bash exits
         // Try to read, should eventually return None or timeout
         let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while handle.read().await.is_some() {
+            while read_rx.recv().await.is_some() {
                 // Keep reading until EOF
             }
         })
@@ -480,11 +447,7 @@ mod tests {
         // since we sent exit and bash should have terminated
 
         // Shutdown should complete without hanging
-        let shutdown_result = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
-        assert!(
-            shutdown_result.is_ok(),
-            "Shutdown timed out, tasks may be stuck"
-        );
+        handle.terminate();
     }
 
     #[tokio::test]
@@ -493,7 +456,7 @@ mod tests {
         let session = PtySession::spawn(&["sh".to_string()], TermSize { cols: 80, rows: 24 }, None)
             .expect("spawn");
 
-        let handle = AsyncPtyHandle::new(session).expect("async handle");
+        let (handle, _read_rx) = AsyncPtyHandle::new(session).expect("async handle");
 
         // Resize via AsyncPtyHandle (sends SIGWINCH to child process)
         handle
