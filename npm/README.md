@@ -88,6 +88,7 @@ The `snapshot` command returns structured data about the terminal screen:
 
 ```json
 {
+  "outcome": "immediate",
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
@@ -96,6 +97,8 @@ The `snapshot` command returns structured data about the terminal screen:
 ```
 
 Use the cursor position and text content to understand the screen state and navigate using keyboard commands (Tab, Enter, arrow keys) or click at specific coordinates.
+
+Snapshots report `immediate`, `changed`, `settled`, `deadline`, or `exited` while preserving the latest screen evidence. Use `--strict` when scripts should exit 3 on a deadline or 4 when the session exits.
 
 ## Documentation
 

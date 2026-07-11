@@ -43,7 +43,8 @@ Wait for change:
   HASH=$(pilotty snapshot | jq -r '.content_hash')
   pilotty key Enter
   pilotty snapshot --await-change $HASH           # Block until screen changes
-  pilotty snapshot --await-change $HASH --settle 100  # Wait for 100ms stability")]
+  pilotty snapshot --await-change $HASH --settle 100  # Wait for 100ms stability
+  pilotty snapshot --settle 100 --strict  # Exit nonzero on deadline/exit")]
     Snapshot(SnapshotArgs),
 
     /// Type text at the current cursor position
@@ -192,6 +193,10 @@ pub struct SnapshotArgs {
     /// Total timeout in milliseconds for await-change and settle combined (default: 30s)
     #[arg(short, long, default_value_t = 30000)]
     pub timeout: u64,
+
+    /// Exit 3 on deadline or 4 on session exit, after printing capture evidence
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -319,8 +324,9 @@ pilotty list-sessions
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
     use clap::Parser;
+
+    use crate::args::{Cli, Commands};
 
     #[test]
     fn test_spawn_parses_hyphenated_args() {
@@ -351,6 +357,16 @@ mod tests {
         match cli.command {
             Commands::Logs(args) => assert_eq!(args.session.as_deref(), Some("editor")),
             _ => panic!("Expected logs command"),
+        }
+    }
+
+    #[test]
+    fn snapshot_parses_strict_mode() {
+        let cli = Cli::parse_from(["pilotty", "snapshot", "--settle", "100", "--strict"]);
+
+        match cli.command {
+            Commands::Snapshot(args) => assert!(args.strict),
+            _ => panic!("Expected snapshot command"),
         }
     }
 }

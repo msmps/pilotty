@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use pilotty_core::error::ApiError;
 use pilotty_core::input::encode_mouse_click_combined;
 use pilotty_core::protocol::{
-    supports_protocol, Command, Request, Response, ResponseData, SnapshotFormat,
+    supports_protocol, CaptureExit, CaptureOutcome, Command, Request, Response, ResponseData,
+    ScreenCapture, SnapshotFormat,
 };
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -20,8 +21,10 @@ use tracing::{debug, error, info, warn};
 use crate::daemon::paths;
 use crate::daemon::pty::TermSize;
 use crate::daemon::retention::DEFAULT_RETAIN_BYTES;
-use crate::daemon::session::{ObservationEvent, SessionEvidence, SessionId, SessionManager};
-use crate::daemon::tombstone::Tombstone;
+use crate::daemon::session::{
+    ObservationEvent, SessionEvidence, SessionId, SessionManager, SessionObserver, SnapshotData,
+};
+use crate::daemon::tombstone::{ExitMetadata, Tombstone};
 
 const RETAIN_BYTES_ENV: &str = "PILOTTY_RETAIN_BYTES";
 
@@ -575,11 +578,13 @@ async fn handle_request(
             handle_snapshot(
                 &request_id,
                 &sessions,
-                session,
-                format,
-                await_change,
-                settle_ms,
-                timeout_ms,
+                SnapshotRequestOptions {
+                    session,
+                    format,
+                    await_change,
+                    settle_ms,
+                    timeout_ms,
+                },
             )
             .await
         }
@@ -756,27 +761,30 @@ async fn handle_status(
     }
 }
 
-/// Minimum useful settle window retained for CLI compatibility.
-const MIN_SETTLE_MS: u64 = 50;
-
-/// Handle snapshot command.
-///
-/// Supports optional wait-for-change semantics:
-/// - `await_change`: Block until content_hash differs from this value
-/// - `settle_ms`: After change detected, wait for screen to be stable this long
-/// - `timeout_ms`: Maximum time to wait for change/settle
-async fn handle_snapshot(
-    request_id: &str,
-    sessions: &SessionManager,
+/// Snapshot behavior requested over the wire.
+struct SnapshotRequestOptions {
     session: Option<String>,
-    format: Option<SnapshotFormat>,
+    format: SnapshotFormat,
     await_change: Option<u64>,
     settle_ms: u64,
     timeout_ms: u64,
+}
+
+/// Handle immediate, wait-for-change, and settle captures.
+async fn handle_snapshot(
+    request_id: &str,
+    sessions: &SessionManager,
+    options: SnapshotRequestOptions,
 ) -> Response {
     use std::time::{Duration, Instant};
 
-    let format = format.unwrap_or(SnapshotFormat::Full);
+    let SnapshotRequestOptions {
+        session,
+        format,
+        await_change,
+        settle_ms,
+        timeout_ms,
+    } = options;
     let evidence = match sessions.resolve_evidence(session.as_deref()).await {
         Ok(evidence) => evidence,
         Err(e) => return Response::error(request_id, e),
@@ -788,35 +796,62 @@ async fn handle_snapshot(
         }
     };
 
-    let with_elements = matches!(format, SnapshotFormat::Full);
     let timeout = Duration::from_millis(timeout_ms);
-    // Retain the shipped minimum settle window.
-    let settle = Duration::from_millis(if settle_ms > 0 {
-        settle_ms.max(MIN_SETTLE_MS)
-    } else {
-        0
-    });
+    let settle = Duration::from_millis(settle_ms);
     let start = Instant::now();
     let mut observer = match sessions.observe_session(&session_id).await {
         Ok(observer) => observer,
-        Err(error) => return Response::error(request_id, error),
+        Err(error) => {
+            if let Some(response) =
+                finalized_snapshot_response(request_id, sessions, &session_id, format).await
+            {
+                return response;
+            }
+            return Response::error(request_id, error);
+        }
     };
+    let mut output_closed = false;
 
     // Phase 1: If await_change is set, wait until content_hash differs
     if let Some(baseline_hash) = await_change {
         loop {
-            if start.elapsed() >= timeout {
-                return Response::error(
+            if output_closed {
+                match exited_live_snapshot_response(
                     request_id,
-                    ApiError::command_failed_with_suggestion(
-                        format!(
+                    sessions,
+                    &session_id,
+                    &mut observer,
+                    format,
+                )
+                .await
+                {
+                    Ok(Some(response)) => return response,
+                    Ok(None) if start.elapsed() < timeout => {
+                        let remaining = timeout.saturating_sub(start.elapsed());
+                        tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(response) => return response,
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                return snapshot_deadline_response(
+                    request_id,
+                    sessions,
+                    &session_id,
+                    &mut observer,
+                    SnapshotDeadline {
+                        format,
+                        output_closed,
+                        note: format!(
                             "Timeout after {}ms waiting for screen to change from hash {}",
-                            timeout_ms,
-                            baseline_hash
+                            timeout_ms, baseline_hash
                         ),
-                        "Screen content did not change. The application may be idle or waiting for input.",
-                    ),
-                );
+                    },
+                )
+                .await;
             }
 
             let snapshot = observer.current(false).await;
@@ -835,10 +870,15 @@ async fn handle_snapshot(
             match observer.wait_for_update(remaining).await {
                 ObservationEvent::Updated => {}
                 ObservationEvent::OutputClosed => {
-                    tokio::time::sleep(remaining).await;
+                    output_closed = true;
                 }
                 ObservationEvent::Deadline => {}
                 ObservationEvent::PumpFailed => {
+                    if let Some(response) =
+                        finalized_snapshot_response(request_id, sessions, &session_id, format).await
+                    {
+                        return response;
+                    }
                     return pump_failure_response(request_id);
                 }
             }
@@ -853,19 +893,43 @@ async fn handle_snapshot(
         let mut stable_since = Instant::now();
 
         loop {
-            if start.elapsed() >= timeout {
-                return Response::error(
+            if output_closed {
+                match exited_live_snapshot_response(
                     request_id,
-                    ApiError::command_failed_with_suggestion(
-                        format!(
+                    sessions,
+                    &session_id,
+                    &mut observer,
+                    format,
+                )
+                .await
+                {
+                    Ok(Some(response)) => return response,
+                    Ok(None) if start.elapsed() < timeout => {
+                        let remaining = timeout.saturating_sub(start.elapsed());
+                        tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(response) => return response,
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                return snapshot_deadline_response(
+                    request_id,
+                    sessions,
+                    &session_id,
+                    &mut observer,
+                    SnapshotDeadline {
+                        format,
+                        output_closed,
+                        note: format!(
                             "Timeout after {}ms waiting for screen to stabilize for {}ms (last hash: {})",
-                            timeout_ms,
-                            settle_ms,
-                            last_hash
+                            timeout_ms, settle_ms, last_hash
                         ),
-                        "Screen kept changing. Try increasing --timeout or --settle.",
-                    ),
-                );
+                    },
+                )
+                .await;
             }
 
             if stable_since.elapsed() >= settle {
@@ -888,21 +952,74 @@ async fn handle_snapshot(
                         stable_since = Instant::now();
                     }
                 }
-                ObservationEvent::OutputClosed => tokio::time::sleep(wait).await,
+                ObservationEvent::OutputClosed => {
+                    output_closed = true;
+                }
                 ObservationEvent::Deadline => {}
                 ObservationEvent::PumpFailed => {
+                    if let Some(response) =
+                        finalized_snapshot_response(request_id, sessions, &session_id, format).await
+                    {
+                        return response;
+                    }
                     return pump_failure_response(request_id);
                 }
             }
         }
     }
 
-    // Phase 3: Take final snapshot with requested format
+    let outcome = if settle_ms > 0 {
+        CaptureOutcome::Settled
+    } else if await_change.is_some() {
+        CaptureOutcome::Changed
+    } else {
+        CaptureOutcome::Immediate
+    };
+    live_snapshot_response(
+        request_id,
+        sessions,
+        &session_id,
+        &mut observer,
+        format,
+        CaptureDetails {
+            outcome,
+            exit: None,
+            note: None,
+        },
+    )
+    .await
+}
+
+struct CaptureDetails {
+    outcome: CaptureOutcome,
+    exit: Option<CaptureExit>,
+    note: Option<String>,
+}
+
+async fn live_snapshot_response(
+    request_id: &str,
+    sessions: &SessionManager,
+    session_id: &SessionId,
+    observer: &mut SessionObserver,
+    format: SnapshotFormat,
+    details: CaptureDetails,
+) -> Response {
+    let with_elements = matches!(format, SnapshotFormat::Full);
     let snapshot = observer.current(with_elements).await;
     debug!(
         "Captured session {} at revision {}",
         session_id, snapshot.revision
     );
+    snapshot_response(request_id, sessions, snapshot, format, details)
+}
+
+fn snapshot_response(
+    request_id: &str,
+    sessions: &SessionManager,
+    snapshot: SnapshotData,
+    format: SnapshotFormat,
+    details: CaptureDetails,
+) -> Response {
     let (cursor_row, cursor_col) = snapshot.cursor_pos;
 
     match format {
@@ -914,6 +1031,9 @@ async fn handle_snapshot(
                 ResponseData::Snapshot {
                     format: SnapshotFormat::Text,
                     content: output,
+                    outcome: details.outcome,
+                    exit: details.exit,
+                    note: details.note,
                 },
             )
         }
@@ -934,7 +1054,15 @@ async fn handle_snapshot(
                 elements: snapshot.elements,
                 content_hash: Some(snapshot.content_hash),
             };
-            Response::success(request_id, ResponseData::ScreenState(screen_state))
+            Response::success(
+                request_id,
+                ResponseData::ScreenState(ScreenCapture {
+                    screen: screen_state,
+                    outcome: details.outcome,
+                    exit: details.exit,
+                    note: details.note,
+                }),
+            )
         }
         SnapshotFormat::Compact => {
             let snapshot_id = sessions.next_snapshot_id();
@@ -953,8 +1081,126 @@ async fn handle_snapshot(
                 elements: None,
                 content_hash: None,
             };
-            Response::success(request_id, ResponseData::ScreenState(screen_state))
+            Response::success(
+                request_id,
+                ResponseData::ScreenState(ScreenCapture {
+                    screen: screen_state,
+                    outcome: details.outcome,
+                    exit: details.exit,
+                    note: details.note,
+                }),
+            )
         }
+    }
+}
+
+async fn snapshot_deadline_response(
+    request_id: &str,
+    sessions: &SessionManager,
+    session_id: &SessionId,
+    observer: &mut SessionObserver,
+    deadline: SnapshotDeadline,
+) -> Response {
+    let SnapshotDeadline {
+        format,
+        output_closed,
+        note,
+    } = deadline;
+
+    if let Some(response) =
+        finalized_snapshot_response(request_id, sessions, session_id, format).await
+    {
+        return response;
+    }
+
+    if output_closed {
+        match exited_live_snapshot_response(request_id, sessions, session_id, observer, format)
+            .await
+        {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(response) => return response,
+        }
+    }
+
+    let note = if output_closed {
+        "PTY output closed, but the process is still running; EOF alone is not an exit.".to_string()
+    } else {
+        note
+    };
+    live_snapshot_response(
+        request_id,
+        sessions,
+        session_id,
+        observer,
+        format,
+        CaptureDetails {
+            outcome: CaptureOutcome::Deadline,
+            exit: None,
+            note: Some(note),
+        },
+    )
+    .await
+}
+
+struct SnapshotDeadline {
+    format: SnapshotFormat,
+    output_closed: bool,
+    note: String,
+}
+
+async fn exited_live_snapshot_response(
+    request_id: &str,
+    sessions: &SessionManager,
+    session_id: &SessionId,
+    observer: &mut SessionObserver,
+    format: SnapshotFormat,
+) -> Result<Option<Response>, Response> {
+    let exit = observer
+        .exit_metadata()
+        .map_err(|error| Response::error(request_id, error))?;
+    let Some(exit) = exit else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        live_snapshot_response(
+            request_id,
+            sessions,
+            session_id,
+            observer,
+            format,
+            CaptureDetails {
+                outcome: CaptureOutcome::Exited,
+                exit: Some(capture_exit(exit, true)),
+                note: None,
+            },
+        )
+        .await,
+    ))
+}
+
+async fn finalized_snapshot_response(
+    request_id: &str,
+    sessions: &SessionManager,
+    session_id: &SessionId,
+    format: SnapshotFormat,
+) -> Option<Response> {
+    match sessions.resolve_evidence(Some(&session_id.0)).await {
+        Ok(SessionEvidence::Exited(tombstone)) => {
+            Some(exited_snapshot_response(request_id, *tombstone, format))
+        }
+        Ok(SessionEvidence::Live(_)) | Err(_) => None,
+    }
+}
+
+fn capture_exit(exit: ExitMetadata, output_complete: bool) -> CaptureExit {
+    CaptureExit {
+        exit_code: exit.code,
+        signal: exit.signal,
+        success: exit.success,
+        killed_by_client: exit.killed_by_client,
+        output_complete,
     }
 }
 
@@ -963,20 +1209,36 @@ fn exited_snapshot_response(
     tombstone: Tombstone,
     format: SnapshotFormat,
 ) -> Response {
+    let details = CaptureDetails {
+        outcome: CaptureOutcome::Exited,
+        exit: Some(capture_exit(tombstone.exit, tombstone.output_complete)),
+        note: None,
+    };
+
     match format {
         SnapshotFormat::Full => Response::success(
             request_id,
-            ResponseData::ScreenState(tombstone.final_screen),
+            ResponseData::ScreenState(ScreenCapture {
+                screen: tombstone.final_screen,
+                outcome: details.outcome,
+                exit: details.exit,
+                note: details.note,
+            }),
         ),
         SnapshotFormat::Compact => Response::success(
             request_id,
-            ResponseData::ScreenState(ScreenState {
-                snapshot_id: tombstone.final_screen.snapshot_id,
-                size: tombstone.final_screen.size,
-                cursor: tombstone.final_screen.cursor,
-                text: None,
-                elements: None,
-                content_hash: None,
+            ResponseData::ScreenState(ScreenCapture {
+                screen: ScreenState {
+                    snapshot_id: tombstone.final_screen.snapshot_id,
+                    size: tombstone.final_screen.size,
+                    cursor: tombstone.final_screen.cursor,
+                    text: None,
+                    elements: None,
+                    content_hash: None,
+                },
+                outcome: details.outcome,
+                exit: details.exit,
+                note: details.note,
             }),
         ),
         SnapshotFormat::Text => {
@@ -995,6 +1257,9 @@ fn exited_snapshot_response(
                 ResponseData::Snapshot {
                     format: SnapshotFormat::Text,
                     content,
+                    outcome: details.outcome,
+                    exit: details.exit,
+                    note: details.note,
                 },
             )
         }
@@ -1516,7 +1781,6 @@ async fn handle_shutdown(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pilotty_core::error::ErrorCode;
     use pilotty_core::protocol::{Command, SessionStatus, PROTOCOL_VERSION};
     use std::time::Duration;
@@ -1525,6 +1789,8 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::time::timeout;
     use uuid::Uuid;
+
+    use crate::daemon::server::*;
 
     async fn socket_request(
         reader: &mut BufReader<OwnedReadHalf>,
@@ -1749,7 +2015,7 @@ mod tests {
                 "snapshot",
                 Command::Snapshot {
                     session: Some("finalized".to_string()),
-                    format: Some(SnapshotFormat::Full),
+                    format: SnapshotFormat::Full,
                     await_change: None,
                     settle_ms: 0,
                     timeout_ms: 1000,
@@ -1761,8 +2027,12 @@ mod tests {
         .await;
         assert!(matches!(
             snapshot.data,
-            Some(ResponseData::ScreenState(ScreenState { text: Some(text), .. }))
-                if text.contains("recovered-evidence")
+            Some(ResponseData::ScreenState(ScreenCapture {
+                screen: ScreenState { text: Some(text), .. },
+                outcome: CaptureOutcome::Exited,
+                exit: Some(CaptureExit { exit_code: Some(9), .. }),
+                ..
+            })) if text.contains("recovered-evidence")
         ));
 
         let logs = handle_request(
@@ -1780,6 +2050,126 @@ mod tests {
             logs.data,
             Some(ResponseData::Logs { bytes, .. }) if bytes.ends_with(b"recovered-evidence")
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_wait_returns_exit_evidence_before_reaper_runs() {
+        let sessions = Arc::new(SessionManager::new());
+        sessions
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf ready; sleep 0.2; exit 7".to_string(),
+                ],
+                Some("exits-during-wait".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create exiting session");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        let baseline = handle_request(
+            Request::new(
+                "baseline",
+                Command::Snapshot {
+                    session: Some("exits-during-wait".to_string()),
+                    format: SnapshotFormat::Full,
+                    await_change: None,
+                    settle_ms: 0,
+                    timeout_ms: 1000,
+                },
+            ),
+            sessions.clone(),
+            Arc::new(Notify::new()),
+        )
+        .await;
+        let baseline_hash = match baseline.data {
+            Some(ResponseData::ScreenState(capture)) => {
+                capture.screen.content_hash.expect("baseline hash")
+            }
+            _ => panic!("expected baseline screen capture"),
+        };
+
+        let waited = handle_request(
+            Request::new(
+                "wait-for-exit",
+                Command::Snapshot {
+                    session: Some("exits-during-wait".to_string()),
+                    format: SnapshotFormat::Full,
+                    await_change: Some(baseline_hash),
+                    settle_ms: 2000,
+                    timeout_ms: 3000,
+                },
+            ),
+            sessions,
+            Arc::new(Notify::new()),
+        )
+        .await;
+
+        assert!(matches!(
+            waited.data,
+            Some(ResponseData::ScreenState(ScreenCapture {
+                screen: ScreenState { text: Some(text), .. },
+                outcome: CaptureOutcome::Exited,
+                exit: Some(CaptureExit {
+                    exit_code: Some(7),
+                    success: false,
+                    output_complete: true,
+                    ..
+                }),
+                ..
+            })) if text.contains("ready")
+        ));
+    }
+
+    #[tokio::test]
+    async fn deadline_does_not_treat_output_eof_as_process_exit() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_id = sessions
+            .create_session(
+                vec!["sleep".to_string(), "10".to_string()],
+                Some("closed-output".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create live session");
+        let mut observer = sessions
+            .observe_session(&session_id)
+            .await
+            .expect("observe live session");
+
+        let response = snapshot_deadline_response(
+            "wait-after-eof",
+            &sessions,
+            &session_id,
+            &mut observer,
+            SnapshotDeadline {
+                format: SnapshotFormat::Full,
+                output_closed: true,
+                note: "deadline".to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &response.data,
+                Some(ResponseData::ScreenState(ScreenCapture {
+                    outcome: CaptureOutcome::Deadline,
+                    exit: None,
+                    note: Some(note),
+                    ..
+                })) if note.contains("EOF alone is not an exit")
+            ),
+            "got: {response:?}"
+        );
+        sessions
+            .kill_session(&session_id)
+            .await
+            .expect("stop output-closing session");
     }
 
     #[tokio::test]
@@ -2149,7 +2539,7 @@ mod tests {
             id: "snap-1".to_string(),
             command: Command::Snapshot {
                 session: Some("test-snap".to_string()),
-                format: Some(SnapshotFormat::Text),
+                format: SnapshotFormat::Text,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -2172,7 +2562,10 @@ mod tests {
         assert!(snap_response.success, "Snapshot should succeed");
 
         // Verify the snapshot contains our text
-        if let Some(ResponseData::Snapshot { format, content }) = snap_response.data {
+        if let Some(ResponseData::Snapshot {
+            format, content, ..
+        }) = snap_response.data
+        {
             assert_eq!(format, SnapshotFormat::Text);
             assert!(
                 content.contains("hello from test"),
@@ -2252,7 +2645,7 @@ mod tests {
             id: "snap-full".to_string(),
             command: Command::Snapshot {
                 session: Some("full-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -2277,30 +2670,36 @@ mod tests {
         if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
             // Check snapshot_id is non-zero
             assert!(
-                screen_state.snapshot_id > 0,
+                screen_state.screen.snapshot_id > 0,
                 "snapshot_id should be positive"
             );
 
             // Check size
-            assert_eq!(screen_state.size.cols, 80, "Default cols should be 80");
-            assert_eq!(screen_state.size.rows, 24, "Default rows should be 24");
+            assert_eq!(
+                screen_state.screen.size.cols, 80,
+                "Default cols should be 80"
+            );
+            assert_eq!(
+                screen_state.screen.size.rows, 24,
+                "Default rows should be 24"
+            );
 
             // Check cursor position is valid
             assert!(
-                screen_state.cursor.row < screen_state.size.rows,
+                screen_state.screen.cursor.row < screen_state.screen.size.rows,
                 "Cursor row should be within bounds"
             );
             assert!(
-                screen_state.cursor.col < screen_state.size.cols,
+                screen_state.screen.cursor.col < screen_state.screen.size.cols,
                 "Cursor col should be within bounds"
             );
 
             // Check text is included in Full format
             assert!(
-                screen_state.text.is_some(),
+                screen_state.screen.text.is_some(),
                 "Full format should include text"
             );
-            let text = screen_state.text.unwrap();
+            let text = screen_state.screen.text.unwrap();
             assert!(
                 text.contains("full format test"),
                 "Text should contain output: {}",
@@ -2403,7 +2802,7 @@ mod tests {
             id: "snap-1".to_string(),
             command: Command::Snapshot {
                 session: Some("type-test".to_string()),
-                format: Some(SnapshotFormat::Text),
+                format: SnapshotFormat::Text,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -3235,7 +3634,7 @@ mod tests {
             id: "snap-baseline".to_string(),
             command: Command::Snapshot {
                 session: Some("await-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -3260,7 +3659,9 @@ mod tests {
         );
 
         let baseline_hash = match baseline_response.data {
-            Some(ResponseData::ScreenState(state)) => state.content_hash.expect("should have hash"),
+            Some(ResponseData::ScreenState(state)) => {
+                state.screen.content_hash.expect("should have hash")
+            }
             _ => panic!("Expected ScreenState"),
         };
 
@@ -3291,7 +3692,7 @@ mod tests {
             id: "snap-await".to_string(),
             command: Command::Snapshot {
                 session: Some("await-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: Some(baseline_hash),
                 settle_ms: 50,
                 timeout_ms: 5000,
@@ -3325,14 +3726,19 @@ mod tests {
 
         // Verify hash actually changed
         if let Some(ResponseData::ScreenState(state)) = await_response.data {
+            assert_eq!(state.outcome, CaptureOutcome::Settled);
             assert_ne!(
-                state.content_hash,
+                state.screen.content_hash,
                 Some(baseline_hash),
                 "Hash should have changed"
             );
             // Verify content contains what we typed
             assert!(
-                state.text.as_ref().is_some_and(|t| t.contains("hello")),
+                state
+                    .screen
+                    .text
+                    .as_ref()
+                    .is_some_and(|t| t.contains("hello")),
                 "Text should contain 'hello'"
             );
         } else {
@@ -3349,7 +3755,7 @@ mod tests {
     /// first iteration and await_change returned instantly on an unchanged
     /// screen.
     #[tokio::test]
-    async fn test_snapshot_await_change_times_out_on_static_screen() {
+    async fn snapshot_await_change_deadline_returns_latest_evidence() {
         let temp_dir = std::env::temp_dir();
         let socket_path =
             temp_dir.join(format!("pilotty-await-static-{}.sock", std::process::id()));
@@ -3404,7 +3810,7 @@ mod tests {
             id: "snap-baseline".to_string(),
             command: Command::Snapshot {
                 session: Some("await-static-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -3424,7 +3830,9 @@ mod tests {
         let baseline_response: Response =
             serde_json::from_str(&response_line).expect("parse baseline response");
         let baseline_hash = match baseline_response.data {
-            Some(ResponseData::ScreenState(state)) => state.content_hash.expect("should have hash"),
+            Some(ResponseData::ScreenState(state)) => {
+                state.screen.content_hash.expect("should have hash")
+            }
             _ => panic!("Expected ScreenState"),
         };
 
@@ -3435,7 +3843,7 @@ mod tests {
             id: "snap-await".to_string(),
             command: Command::Snapshot {
                 session: Some("await-static-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: Some(baseline_hash),
                 settle_ms: 0,
                 timeout_ms: 500,
@@ -3458,21 +3866,24 @@ mod tests {
 
         let await_response: Response =
             serde_json::from_str(&response_line).expect("parse await response");
-        assert!(
-            !await_response.success,
-            "Awaiting a change on a static screen should time out, not succeed"
-        );
+        assert!(await_response.success);
         assert!(
             elapsed >= Duration::from_millis(400),
             "Should have waited close to the 500ms timeout, returned after {:?}",
             elapsed
         );
-        let error = await_response.error.expect("should have error");
-        assert!(
-            error.message.contains("Timeout"),
-            "Error should mention timeout, got: {}",
-            error.message
-        );
+        assert!(matches!(
+            await_response.data,
+            Some(ResponseData::ScreenState(ScreenCapture {
+                screen: ScreenState {
+                    content_hash: Some(hash),
+                    ..
+                },
+                outcome: CaptureOutcome::Deadline,
+                exit: None,
+                note: Some(note),
+            })) if hash == baseline_hash && note.contains("Timeout")
+        ));
 
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
@@ -3483,7 +3894,7 @@ mod tests {
     /// as stable and settle degraded to a fixed sleep — the "kept changing"
     /// timeout branch was unreachable.
     #[tokio::test]
-    async fn test_snapshot_settle_times_out_when_screen_keeps_changing() {
+    async fn snapshot_settle_deadline_returns_latest_evidence() {
         let temp_dir = std::env::temp_dir();
         let socket_path = temp_dir.join(format!("pilotty-settle-busy-{}.sock", std::process::id()));
         let pid_path = socket_path.with_extension("pid");
@@ -3542,7 +3953,7 @@ mod tests {
             id: "snap-settle".to_string(),
             command: Command::Snapshot {
                 session: Some("settle-busy-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: None,
                 settle_ms: 200,
                 timeout_ms: 800,
@@ -3565,21 +3976,21 @@ mod tests {
 
         let settle_response: Response =
             serde_json::from_str(&response_line).expect("parse settle response");
-        assert!(
-            !settle_response.success,
-            "Settle on a continuously changing screen should time out, not succeed"
-        );
+        assert!(settle_response.success);
         assert!(
             elapsed >= Duration::from_millis(700),
             "Should have waited close to the 800ms timeout, returned after {:?}",
             elapsed
         );
-        let error = settle_response.error.expect("should have error");
-        assert!(
-            error.message.contains("stabilize"),
-            "Error should mention stabilization, got: {}",
-            error.message
-        );
+        assert!(matches!(
+            settle_response.data,
+            Some(ResponseData::ScreenState(ScreenCapture {
+                screen: ScreenState { text: Some(text), .. },
+                outcome: CaptureOutcome::Deadline,
+                exit: None,
+                note: Some(note),
+            })) if text.contains("tick") && note.contains("stabilize")
+        ));
 
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
@@ -3719,7 +4130,7 @@ mod tests {
             id: "snap-elem".to_string(),
             command: Command::Snapshot {
                 session: Some("elem-test".to_string()),
-                format: Some(SnapshotFormat::Full),
+                format: SnapshotFormat::Full,
                 await_change: None,
                 settle_ms: 0,
                 timeout_ms: 30000,
@@ -3744,23 +4155,23 @@ mod tests {
         if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
             // Full format includes text
             assert!(
-                screen_state.text.is_some(),
+                screen_state.screen.text.is_some(),
                 "Full format should include text"
             );
 
             // Full format SHOULD include elements
             assert!(
-                screen_state.elements.is_some(),
+                screen_state.screen.elements.is_some(),
                 "Full format should include elements"
             );
 
             // Full format SHOULD include content_hash
             assert!(
-                screen_state.content_hash.is_some(),
+                screen_state.screen.content_hash.is_some(),
                 "Full format should include content_hash"
             );
 
-            let elements = screen_state.elements.unwrap();
+            let elements = screen_state.screen.elements.unwrap();
 
             // Should detect at least the toggles (checkboxes are high confidence)
             // [x] -> Toggle checked=true, [ ] -> Toggle checked=false

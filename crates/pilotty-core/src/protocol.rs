@@ -93,7 +93,8 @@ pub enum Command {
     /// stabilizes for a specified duration.
     Snapshot {
         session: Option<String>,
-        format: Option<SnapshotFormat>,
+        #[serde(default)]
+        format: SnapshotFormat,
         /// If set, block until content_hash differs from this value.
         #[serde(default)]
         await_change: Option<u64>,
@@ -166,13 +167,13 @@ impl Command {
                 retain_bytes: Some(_),
                 ..
             }
+            | Self::Snapshot { .. }
             | Self::Logs { .. }
             | Self::Status { .. } => PROTOCOL_V2,
             Self::Spawn {
                 retain_bytes: None, ..
             }
             | Self::Kill { .. }
-            | Self::Snapshot { .. }
             | Self::Type { .. }
             | Self::Key { .. }
             | Self::Click { .. }
@@ -196,6 +197,39 @@ pub enum SnapshotFormat {
     Compact,
     /// Plain text only (no JSON structure).
     Text,
+}
+
+/// How an outcome-aware snapshot completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureOutcome {
+    Immediate,
+    Settled,
+    Changed,
+    Deadline,
+    Exited,
+}
+
+/// Process evidence attached when a capture observes an exited session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureExit {
+    pub exit_code: Option<u32>,
+    pub signal: Option<String>,
+    pub success: bool,
+    pub killed_by_client: bool,
+    pub output_complete: bool,
+}
+
+/// A screen capture with optional wait and lifecycle evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenCapture {
+    #[serde(flatten)]
+    pub screen: ScreenState,
+    pub outcome: CaptureOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<CaptureExit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Scroll direction.
@@ -262,11 +296,16 @@ impl Response {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseData {
     /// Full screen state snapshot.
-    ScreenState(ScreenState),
+    ScreenState(ScreenCapture),
     /// Text-format snapshot.
     Snapshot {
         format: SnapshotFormat,
         content: String,
+        outcome: CaptureOutcome,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit: Option<CaptureExit>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// Session created response.
     SessionCreated { session_id: String, message: String },
@@ -299,13 +338,22 @@ impl ResponseData {
     /// older client.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
-            Self::Logs { .. } | Self::Status(_) => PROTOCOL_V2,
-            Self::ScreenState(_)
-            | Self::Snapshot { .. }
-            | Self::SessionCreated { .. }
+            Self::ScreenState(_) | Self::Snapshot { .. } | Self::Logs { .. } | Self::Status(_) => {
+                PROTOCOL_V2
+            }
+            Self::SessionCreated { .. }
             | Self::Sessions { .. }
             | Self::WaitForResult { .. }
             | Self::Ok { .. } => LEGACY_PROTOCOL_VERSION,
+        }
+    }
+
+    /// Return the outcome attached to a screen or text capture.
+    pub fn capture_outcome(&self) -> Option<CaptureOutcome> {
+        match self {
+            Self::ScreenState(capture) => Some(capture.outcome),
+            Self::Snapshot { outcome, .. } => Some(*outcome),
+            _ => None,
         }
     }
 }
@@ -361,7 +409,7 @@ pub enum SessionStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::protocol::*;
 
     #[test]
     fn request_serializes_with_protocol_version() {
@@ -488,9 +536,17 @@ mod tests {
                 truncated: true,
             },
         };
+        let outcome_snapshot = Command::Snapshot {
+            session: None,
+            format: SnapshotFormat::Full,
+            await_change: None,
+            settle_ms: 0,
+            timeout_ms: 30_000,
+        };
 
         assert_eq!(plain_spawn.minimum_protocol(), LEGACY_PROTOCOL_VERSION);
         assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_V2);
+        assert_eq!(outcome_snapshot.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(
             Command::Logs { session: None }.minimum_protocol(),
             PROTOCOL_V2
@@ -500,6 +556,27 @@ mod tests {
             PROTOCOL_V2
         );
         assert_eq!(ResponseData::Status(status).minimum_protocol(), PROTOCOL_V2);
+    }
+
+    #[test]
+    fn capture_outcome_round_trips_as_flat_snapshot_evidence() {
+        let response = ResponseData::ScreenState(ScreenCapture {
+            screen: ScreenState::empty(80, 24),
+            outcome: CaptureOutcome::Deadline,
+            exit: None,
+            note: Some("Screen kept changing".to_string()),
+        });
+
+        assert_eq!(response.minimum_protocol(), PROTOCOL_V2);
+        let json = serde_json::to_string(&response).expect("serialize capture outcome");
+        assert!(json.contains("\"type\":\"screen_state\""), "got: {json}");
+        assert!(json.contains("\"outcome\":\"deadline\""), "got: {json}");
+        assert!(json.contains("\"snapshot_id\":0"), "got: {json}");
+        assert!(!json.contains("\"screen\""), "got: {json}");
+
+        let decoded: ResponseData =
+            serde_json::from_str(&json).expect("deserialize capture outcome");
+        assert_eq!(decoded, response);
     }
 
     #[test]

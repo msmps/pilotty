@@ -160,6 +160,7 @@ pilotty snapshot --format text    # Plain text with cursor indicator
 # Wait for screen to change before returning (no more manual sleep!)
 pilotty snapshot --await-change $HASH           # Block until hash differs
 pilotty snapshot --await-change $HASH --settle 100  # Then wait for stability
+pilotty snapshot --settle 100 --strict  # Fail on deadline or session exit
 ```
 
 ### Input
@@ -207,6 +208,7 @@ The `snapshot` command returns structured data about the terminal screen:
 
 ```json
 {
+  "outcome": "immediate",
   "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
@@ -220,6 +222,11 @@ The `snapshot` command returns structured data about the terminal screen:
   "content_hash": 12345678901234567890
 }
 ```
+
+JSON snapshots always include an `outcome`: `immediate`, `changed`, `settled`,
+`deadline`, or `exited`. Deadline and exit outcomes return the latest available screen evidence
+instead of replacing it with an error. Exited captures include process exit metadata and
+whether the final output was completely drained.
 
 ## UI Elements (Contextual)
 
@@ -272,6 +279,12 @@ pilotty snapshot --await-change $HASH --settle 100  # Wait 100ms after last chan
 - `--await-change <HASH>`: Block until `content_hash` differs from this value
 - `--settle <MS>`: After change detected, wait for screen to be stable for this many ms
 - `-t, --timeout <MS>`: Maximum wait time (default: 30000)
+- `--strict`: Preserve printed evidence but exit 3 on deadline or 4 on session exit
+
+Without `--strict`, every capture outcome exits 0. CLI exit categories are: 0
+success, 1 generic/API error, 2 command-line usage, 3 timing deadline, and 4 session
+lifecycle. Commands that require a live process also exit 4 when they receive
+`SESSION_EXITED`.
 
 **Why this matters:**
 - No more flaky automation due to race conditions
