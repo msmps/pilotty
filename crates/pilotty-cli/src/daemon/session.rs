@@ -74,6 +74,11 @@ pub(crate) struct SnapshotData {
     pub(crate) revision: u64,
 }
 
+pub(crate) struct LogEvidence {
+    pub(crate) output: RetentionSnapshot,
+    pub(crate) size: TermSize,
+}
+
 /// Latest state published by a session's output pump.
 #[derive(Debug, Clone, Copy)]
 struct PumpState {
@@ -794,11 +799,12 @@ impl SessionManager {
             .map_err(|e| ApiError::write_failed(&e.to_string()))
     }
 
-    /// Capture the retained raw output and its exact accounting.
-    pub(crate) async fn session_logs(&self, id: &SessionId) -> Result<RetentionSnapshot, ApiError> {
+    /// Capture retained output accounting and the geometry needed to render it.
+    pub(crate) async fn session_logs(&self, id: &SessionId) -> Result<LogEvidence, ApiError> {
         let session = self.session(id).await?;
-        let snapshot = session.retention.lock().await.snapshot();
-        Ok(snapshot)
+        let size = session.observed_terminal.lock().await.size;
+        let output = session.retention.lock().await.snapshot();
+        Ok(LogEvidence { output, size })
     }
 
     /// Resize a session's terminal.
@@ -1637,7 +1643,7 @@ mod tests {
         let logs = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let logs = manager.session_logs(&id).await.expect("read logs");
-                if logs.total_bytes == 6 {
+                if logs.output.total_bytes == 6 {
                     break logs;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1646,10 +1652,11 @@ mod tests {
         .await
         .expect("session output");
 
-        assert_eq!(logs.bytes, b"cdef");
-        assert_eq!(logs.retained_bytes, 4);
-        assert_eq!(logs.dropped_bytes, 2);
-        assert!(logs.truncated);
+        assert_eq!(logs.output.bytes, b"cdef");
+        assert_eq!(logs.output.retained_bytes, 4);
+        assert_eq!(logs.output.dropped_bytes, 2);
+        assert!(logs.output.truncated);
+        assert_eq!(logs.size, TermSize::default());
         manager.kill_session(&id).await.expect("remove session");
     }
 
@@ -1674,7 +1681,7 @@ mod tests {
         let logs = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let logs = manager.session_logs(&id).await.expect("read logs");
-                if logs.total_bytes == expected.len() as u64 {
+                if logs.output.total_bytes == expected.len() as u64 {
                     break logs;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1683,9 +1690,9 @@ mod tests {
         .await
         .expect("session output");
 
-        assert_eq!(logs.bytes, expected);
-        assert_eq!(logs.dropped_bytes, 0);
-        assert!(!logs.truncated);
+        assert_eq!(logs.output.bytes, expected);
+        assert_eq!(logs.output.dropped_bytes, 0);
+        assert!(!logs.output.truncated);
         manager.kill_session(&id).await.expect("remove session");
     }
 

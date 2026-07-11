@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use pilotty_core::error::ApiError;
 use pilotty_core::input::encode_mouse_click_combined;
 use pilotty_core::protocol::{
-    supports_protocol, CaptureExit, CaptureOutcome, Command, Request, Response, ResponseData,
-    ScreenCapture, SnapshotFormat,
+    supports_protocol, CaptureExit, CaptureOutcome, Command, LogsFormat, Request, Response,
+    ResponseData, ScreenCapture, SnapshotFormat,
 };
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -20,10 +20,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::paths;
 use crate::daemon::pty::TermSize;
-use crate::daemon::retention::DEFAULT_RETAIN_BYTES;
+use crate::daemon::retention::{RetentionSnapshot, DEFAULT_RETAIN_BYTES};
 use crate::daemon::session::{
-    ObservationEvent, SessionEvidence, SessionId, SessionManager, SessionObserver, SnapshotData,
+    LogEvidence, ObservationEvent, SessionEvidence, SessionId, SessionManager, SessionObserver,
+    SnapshotData,
 };
+use crate::daemon::terminal::render_retained_output;
 use crate::daemon::tombstone::{ExitMetadata, Tombstone};
 
 const RETAIN_BYTES_ENV: &str = "PILOTTY_RETAIN_BYTES";
@@ -591,7 +593,7 @@ async fn handle_request(
 
         Command::ListSessions => handle_list_sessions(&request_id, &sessions).await,
 
-        Command::Logs { session } => handle_logs(&request_id, &sessions, session).await,
+        Command::Logs { session, ansi } => handle_logs(&request_id, &sessions, session, ansi).await,
 
         Command::Status { session } => handle_status(&request_id, &sessions, session).await,
 
@@ -724,6 +726,7 @@ async fn handle_logs(
     request_id: &str,
     sessions: &SessionManager,
     session: Option<String>,
+    ansi: bool,
 ) -> Response {
     let evidence = match sessions.resolve_evidence(session.as_deref()).await {
         Ok(evidence) => evidence,
@@ -732,21 +735,56 @@ async fn handle_logs(
 
     let logs = match evidence {
         SessionEvidence::Live(session_id) => sessions.session_logs(&session_id).await,
-        SessionEvidence::Exited(tombstone) => Ok(tombstone.output),
+        SessionEvidence::Exited(tombstone) => Ok(LogEvidence {
+            size: TermSize {
+                cols: tombstone.final_screen.size.cols,
+                rows: tombstone.final_screen.size.rows,
+            },
+            output: tombstone.output,
+        }),
     };
     match logs {
-        Ok(logs) => Response::success(
-            request_id,
-            ResponseData::Logs {
-                bytes: logs.bytes,
-                total_bytes: logs.total_bytes,
-                retained_bytes: logs.retained_bytes,
-                dropped_bytes: logs.dropped_bytes,
-                truncated: logs.truncated,
-            },
-        ),
+        Ok(logs) => logs_response(request_id, logs, ansi).await,
         Err(error) => Response::error(request_id, error),
     }
+}
+
+async fn logs_response(request_id: &str, logs: LogEvidence, ansi: bool) -> Response {
+    let RetentionSnapshot {
+        bytes,
+        total_bytes,
+        retained_bytes,
+        dropped_bytes,
+        truncated,
+    } = logs.output;
+    let (format, bytes) = if ansi {
+        (LogsFormat::Ansi, bytes)
+    } else {
+        let size = logs.size;
+        let rendered =
+            tokio::task::spawn_blocking(move || render_retained_output(&bytes, size)).await;
+        match rendered {
+            Ok(text) => (LogsFormat::Text, text.into_bytes()),
+            Err(error) => {
+                return Response::error(
+                    request_id,
+                    ApiError::internal(format!("Failed to render retained output: {error}")),
+                )
+            }
+        }
+    };
+
+    Response::success(
+        request_id,
+        ResponseData::Logs {
+            format,
+            bytes,
+            total_bytes,
+            retained_bytes,
+            dropped_bytes,
+            truncated,
+        },
+    )
 }
 
 /// Handle status command.
@@ -1824,11 +1862,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logs_render_text_by_default_and_preserve_ansi_on_request() {
+        let raw = b"\x1b[31mred\x1b[0m".to_vec();
+        let evidence = || LogEvidence {
+            output: RetentionSnapshot {
+                bytes: raw.clone(),
+                total_bytes: raw.len() as u64,
+                retained_bytes: raw.len() as u64,
+                dropped_bytes: 0,
+                truncated: false,
+            },
+            size: TermSize { cols: 80, rows: 24 },
+        };
+
+        let text = logs_response("text", evidence(), false).await;
+        assert!(matches!(
+            text.data,
+            Some(ResponseData::Logs {
+                format: LogsFormat::Text,
+                bytes,
+                ..
+            }) if bytes == b"red"
+        ));
+
+        let ansi = logs_response("ansi", evidence(), true).await;
+        assert!(matches!(
+            ansi.data,
+            Some(ResponseData::Logs {
+                format: LogsFormat::Ansi,
+                bytes,
+                ..
+            }) if bytes == raw
+        ));
+    }
+
+    #[tokio::test]
     async fn legacy_request_cannot_dispatch_logs() {
         let response = handle_request(
             Request {
                 id: "legacy-logs".to_string(),
-                command: Command::Logs { session: None },
+                command: Command::Logs {
+                    session: None,
+                    ansi: false,
+                },
                 protocol: 0,
             },
             Arc::new(SessionManager::new()),
@@ -2040,6 +2116,28 @@ mod tests {
                 "logs",
                 Command::Logs {
                     session: Some("finalized".to_string()),
+                    ansi: true,
+                },
+            ),
+            sessions.clone(),
+            shutdown.clone(),
+        )
+        .await;
+        assert!(matches!(
+            logs.data,
+            Some(ResponseData::Logs {
+                format: LogsFormat::Ansi,
+                bytes,
+                ..
+            }) if bytes.ends_with(b"recovered-evidence")
+        ));
+
+        let readable_logs = handle_request(
+            Request::new(
+                "readable-logs",
+                Command::Logs {
+                    session: Some("finalized".to_string()),
+                    ansi: false,
                 },
             ),
             sessions,
@@ -2047,8 +2145,12 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            logs.data,
-            Some(ResponseData::Logs { bytes, .. }) if bytes.ends_with(b"recovered-evidence")
+            readable_logs.data,
+            Some(ResponseData::Logs {
+                format: LogsFormat::Text,
+                bytes,
+                ..
+            }) if std::str::from_utf8(&bytes).is_ok_and(|text| text.contains("recovered-evidence"))
         ));
     }
 
@@ -2223,6 +2325,7 @@ mod tests {
                     Uuid::new_v4().to_string(),
                     Command::Logs {
                         session: Some("logs-test".to_string()),
+                        ansi: true,
                     },
                 );
                 writer
@@ -2253,6 +2356,7 @@ mod tests {
         assert_eq!(
             logs.data,
             Some(ResponseData::Logs {
+                format: LogsFormat::Ansi,
                 bytes: b"cdef".to_vec(),
                 total_bytes: 6,
                 retained_bytes: 4,

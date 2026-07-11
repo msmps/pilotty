@@ -77,6 +77,17 @@ pilotty snapshot --await-change $HASH --settle 50  # Wait for 50ms stability
 pilotty snapshot --settle 50 --strict           # Exit nonzero on deadline/exit
 ```
 
+### Retained output
+
+```bash
+pilotty logs                     # Readable rendered output history
+pilotty logs -s myapp            # Readable history for a named session
+pilotty logs -s myapp --ansi     # Exact retained ANSI/VT bytes
+```
+
+Use readable logs to inspect output that has left the visible viewport. Use `--ansi`
+only when exact terminal bytes are required for replay or diagnostics.
+
 ### Input
 
 ```bash
@@ -134,6 +145,7 @@ pilotty wait-for "~" -s editor    # Wait in specific session
 | `--await-change <hash>` | Block snapshot until content_hash differs |
 | `--settle <ms>` | Wait for screen to be stable for this many ms (default: 0) |
 | `--strict` | Exit 3 on capture deadline or 4 when the session exits |
+| `--ansi` | Write exact retained ANSI/VT bytes from `logs` |
 
 ### Environment variables
 

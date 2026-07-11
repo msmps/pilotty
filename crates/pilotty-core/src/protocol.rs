@@ -135,8 +135,12 @@ pub enum Command {
     },
     /// List all active sessions.
     ListSessions,
-    /// Get the retained raw output for a session.
-    Logs { session: Option<String> },
+    /// Get readable retained output or exact ANSI/VT bytes for a session.
+    Logs {
+        session: Option<String>,
+        #[serde(default)]
+        ansi: bool,
+    },
     /// Get live or finalized lifecycle status for a session.
     Status { session: Option<String> },
     /// Resize the terminal.
@@ -197,6 +201,14 @@ pub enum SnapshotFormat {
     Compact,
     /// Plain text only (no JSON structure).
     Text,
+}
+
+/// Representation returned by the logs command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogsFormat {
+    Text,
+    Ansi,
 }
 
 /// How an outcome-aware snapshot completed.
@@ -319,8 +331,9 @@ pub enum ResponseData {
     },
     /// Generic success message.
     Ok { message: String },
-    /// Bounded raw output retained for a session.
+    /// Readable or exact output derived from a session's bounded retention window.
     Logs {
+        format: LogsFormat,
         bytes: Vec<u8>,
         total_bytes: u64,
         retained_bytes: u64,
@@ -505,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_a_wire_variants_require_protocol_v2() {
+    fn versioned_wire_variants_declare_minimum_protocol() {
         let plain_spawn = Command::Spawn {
             command: vec!["sh".to_string()],
             session_name: None,
@@ -548,7 +561,11 @@ mod tests {
         assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(outcome_snapshot.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(
-            Command::Logs { session: None }.minimum_protocol(),
+            Command::Logs {
+                session: None,
+                ansi: false,
+            }
+            .minimum_protocol(),
             PROTOCOL_V2
         );
         assert_eq!(
@@ -580,8 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn logs_response_requires_current_protocol_and_preserves_raw_bytes() {
+    fn logs_response_requires_protocol_v2_and_preserves_raw_bytes() {
         let response = ResponseData::Logs {
+            format: LogsFormat::Ansi,
             bytes: vec![0, 27, 255],
             total_bytes: 9,
             retained_bytes: 3,

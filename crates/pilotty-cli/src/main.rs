@@ -6,7 +6,7 @@ mod daemon;
 use clap::Parser;
 use pilotty_core::error::ErrorCode;
 use pilotty_core::protocol::{
-    CaptureOutcome, Command, Request, ResponseData, ScrollDirection, SnapshotFormat,
+    CaptureOutcome, Command, LogsFormat, Request, ResponseData, ScrollDirection, SnapshotFormat,
 };
 use std::io::Write;
 use tracing::{error, info};
@@ -120,6 +120,7 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         Commands::ListSessions => Some(Command::ListSessions),
         Commands::Logs(args) => Some(Command::Logs {
             session: args.session.clone(),
+            ansi: args.ansi,
         }),
         Commands::Status(args) => Some(Command::Status {
             session: args.session.clone(),
@@ -190,6 +191,7 @@ fn run_client_command(cli: Cli) -> anyhow::Result<CliExitCode> {
                         println!("{}", content);
                     }
                     ResponseData::Logs {
+                        format,
                         bytes,
                         total_bytes,
                         retained_bytes,
@@ -197,10 +199,18 @@ fn run_client_command(cli: Cli) -> anyhow::Result<CliExitCode> {
                         truncated,
                     } => {
                         std::io::stdout().write_all(&bytes)?;
+                        if format == LogsFormat::Text && !bytes.ends_with(b"\n") {
+                            std::io::stdout().write_all(b"\n")?;
+                        }
                         std::io::stdout().flush()?;
+                        let format_name = match format {
+                            LogsFormat::Text => "text",
+                            LogsFormat::Ansi => "ansi",
+                        };
                         eprintln!(
-                            "retention: total_bytes={total_bytes} retained_bytes={retained_bytes} \
-                             dropped_bytes={dropped_bytes} truncated={truncated}"
+                            "retention: format={format_name} total_bytes={total_bytes} \
+                             retained_bytes={retained_bytes} dropped_bytes={dropped_bytes} \
+                             truncated={truncated}"
                         );
                     }
                     _ => println!("{}", serde_json::to_string_pretty(&data)?),

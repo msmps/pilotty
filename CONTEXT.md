@@ -66,8 +66,9 @@ _Avoid_: capture reason
 ### Evidence
 
 **Retention ring**:
-The bounded in-memory buffer of a session's most recent raw output bytes, served by
-`logs`. Always on, always bounded, truncation always reported.
+The bounded in-memory buffer of a session's most recent raw output bytes. `logs` renders
+its readable terminal-history tail; `logs --ansi` serves the exact retained bytes.
+Always on, always bounded, truncation always reported.
 _Avoid_: scrollback (the emulator concept), log file
 
 **Recording**:

@@ -7,6 +7,8 @@ use crate::daemon::pty::TermSize;
 use pilotty_core::elements::grid::{ScreenCell, ScreenGrid};
 use pilotty_core::elements::style::{CellStyle, Color};
 
+const READABLE_LOG_SCROLLBACK_ROWS: usize = 10_000;
+
 /// Terminal emulator that parses ANSI escape sequences.
 ///
 /// Wraps vt100::Parser to maintain an in-memory representation
@@ -93,6 +95,35 @@ impl TerminalEmulator {
     }
 }
 
+/// Replay retained terminal bytes into a readable bounded scrollback tail.
+pub(crate) fn render_retained_output(bytes: &[u8], size: TermSize) -> String {
+    let mut parser = vt100::Parser::new(size.rows, size.cols, READABLE_LOG_SCROLLBACK_ROWS);
+    parser.process(bytes);
+
+    let mut screen = parser.screen().clone();
+    screen.set_scrollback(usize::MAX);
+    let mut offset = screen.scrollback();
+    let mut lines = Vec::new();
+    while offset > 0 {
+        screen.set_scrollback(offset);
+        let count = offset.min(usize::from(size.rows));
+        lines.extend(
+            screen
+                .rows(0, size.cols)
+                .take(count)
+                .map(|line| line.trim_end().to_owned()),
+        );
+        offset = offset.saturating_sub(usize::from(size.rows));
+    }
+    screen.set_scrollback(0);
+    lines.extend(
+        screen
+            .rows(0, size.cols)
+            .map(|line| line.trim_end().to_owned()),
+    );
+    lines.join("\n").trim_end().to_owned()
+}
+
 /// Convert vt100 color to core Color type.
 fn convert_color(vt_color: vt100::Color) -> Color {
     match vt_color {
@@ -156,6 +187,18 @@ mod tests {
         let (row, col) = term.cursor_position();
         assert_eq!(row, 0);
         assert_eq!(col, 11);
+    }
+
+    #[test]
+    fn retained_output_renders_scrollback_and_terminal_updates() {
+        let text = render_retained_output(
+            b"one\r\ntwo\r\nworking\r\x1b[2Kthree",
+            TermSize { cols: 10, rows: 2 },
+        );
+
+        assert_eq!(text, "one\ntwo\nthree");
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains("working"));
     }
 
     #[test]

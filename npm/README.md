@@ -40,6 +40,12 @@ pilotty spawn --cwd /path/to/project bun src/app.tsx
 # Take a snapshot of the terminal
 pilotty snapshot
 
+# Inspect readable retained output
+pilotty logs
+
+# Preserve exact terminal bytes
+pilotty logs --ansi > output.ansi
+
 # Type text
 pilotty type "hello world"
 

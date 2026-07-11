@@ -96,7 +96,7 @@ Examples:
     /// List all active sessions
     ListSessions,
 
-    /// Print retained raw output for a session
+    /// Print readable retained output for a session
     Logs(LogsArgs),
 
     /// Report whether a session is running or exited
@@ -164,6 +164,10 @@ pub struct LogsArgs {
     /// Target session by name or ID [default: default]
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,
+
+    /// Write exact retained ANSI/VT bytes instead of readable rendered output
+    #[arg(long)]
+    pub ansi: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -355,7 +359,20 @@ mod tests {
         let cli = Cli::parse_from(["pilotty", "logs", "--session", "editor"]);
 
         match cli.command {
-            Commands::Logs(args) => assert_eq!(args.session.as_deref(), Some("editor")),
+            Commands::Logs(args) => {
+                assert_eq!(args.session.as_deref(), Some("editor"));
+                assert!(!args.ansi);
+            }
+            _ => panic!("Expected logs command"),
+        }
+    }
+
+    #[test]
+    fn logs_parses_ansi_output() {
+        let cli = Cli::parse_from(["pilotty", "logs", "--ansi"]);
+
+        match cli.command {
+            Commands::Logs(args) => assert!(args.ansi),
             _ => panic!("Expected logs command"),
         }
     }
