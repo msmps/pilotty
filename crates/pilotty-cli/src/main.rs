@@ -93,6 +93,9 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
         Commands::Logs(args) => Some(Command::Logs {
             session: args.session.clone(),
         }),
+        Commands::Status(args) => Some(Command::Status {
+            session: args.session.clone(),
+        }),
         Commands::Resize(args) => Some(Command::Resize {
             cols: args.cols,
             rows: args.rows,

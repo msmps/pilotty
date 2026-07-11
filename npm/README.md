@@ -62,6 +62,10 @@ pilotty click 10 5
 # List active sessions
 pilotty list-sessions
 
+# Inspect a live or recently exited session
+pilotty status
+pilotty status -s myapp
+
 # Stop the daemon
 pilotty stop
 ```

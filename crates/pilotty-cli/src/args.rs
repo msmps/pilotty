@@ -98,6 +98,13 @@ Examples:
     /// Print retained raw output for a session
     Logs(LogsArgs),
 
+    /// Report whether a session is running or exited
+    #[command(after_help = "\
+Examples:
+  pilotty status                      # Status of the default session
+  pilotty status -s editor            # Status of a named session")]
+    Status(StatusArgs),
+
     /// Resize the terminal
     Resize(ResizeArgs),
 
@@ -153,6 +160,13 @@ pub struct KillArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct LogsArgs {
+    /// Target session by name or ID [default: default]
+    #[arg(short, long, help = SESSION_HELP)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct StatusArgs {
     /// Target session by name or ID [default: default]
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,
