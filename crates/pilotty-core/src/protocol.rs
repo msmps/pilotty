@@ -39,6 +39,7 @@ impl ApiError {
             | ErrorCode::CommandFailed
             | ErrorCode::InvalidInput
             | ErrorCode::InternalError => LEGACY_PROTOCOL_VERSION,
+            ErrorCode::SessionExited => PROTOCOL_VERSION,
         }
     }
 }

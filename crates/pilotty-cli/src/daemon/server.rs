@@ -18,8 +18,10 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::paths;
+use crate::daemon::pty::TermSize;
 use crate::daemon::retention::DEFAULT_RETAIN_BYTES;
-use crate::daemon::session::{ObservationEvent, SessionId, SessionManager};
+use crate::daemon::session::{ObservationEvent, SessionEvidence, SessionId, SessionManager};
+use crate::daemon::tombstone::Tombstone;
 
 const RETAIN_BYTES_ENV: &str = "PILOTTY_RETAIN_BYTES";
 
@@ -716,12 +718,16 @@ async fn handle_logs(
     sessions: &SessionManager,
     session: Option<String>,
 ) -> Response {
-    let session_id = match sessions.resolve_session(session.as_deref()).await {
-        Ok(id) => id,
+    let evidence = match sessions.resolve_evidence(session.as_deref()).await {
+        Ok(evidence) => evidence,
         Err(error) => return Response::error(request_id, error),
     };
 
-    match sessions.session_logs(&session_id).await {
+    let logs = match evidence {
+        SessionEvidence::Live(session_id) => sessions.session_logs(&session_id).await,
+        SessionEvidence::Exited(tombstone) => Ok(tombstone.output),
+    };
+    match logs {
         Ok(logs) => Response::success(
             request_id,
             ResponseData::Logs {
@@ -756,13 +762,18 @@ async fn handle_snapshot(
 ) -> Response {
     use std::time::{Duration, Instant};
 
-    // Resolve session first
-    let session_id = match sessions.resolve_session(session.as_deref()).await {
-        Ok(id) => id,
+    let format = format.unwrap_or(SnapshotFormat::Full);
+    let evidence = match sessions.resolve_evidence(session.as_deref()).await {
+        Ok(evidence) => evidence,
         Err(e) => return Response::error(request_id, e),
     };
+    let session_id = match evidence {
+        SessionEvidence::Live(id) => id,
+        SessionEvidence::Exited(tombstone) => {
+            return exited_snapshot_response(request_id, *tombstone, format)
+        }
+    };
 
-    let format = format.unwrap_or(SnapshotFormat::Full);
     let with_elements = matches!(format, SnapshotFormat::Full);
     let timeout = Duration::from_millis(timeout_ms);
     // Retain the shipped minimum settle window.
@@ -929,6 +940,49 @@ async fn handle_snapshot(
                 content_hash: None,
             };
             Response::success(request_id, ResponseData::ScreenState(screen_state))
+        }
+    }
+}
+
+fn exited_snapshot_response(
+    request_id: &str,
+    tombstone: Tombstone,
+    format: SnapshotFormat,
+) -> Response {
+    match format {
+        SnapshotFormat::Full => Response::success(
+            request_id,
+            ResponseData::ScreenState(tombstone.final_screen),
+        ),
+        SnapshotFormat::Compact => Response::success(
+            request_id,
+            ResponseData::ScreenState(ScreenState {
+                snapshot_id: tombstone.final_screen.snapshot_id,
+                size: tombstone.final_screen.size,
+                cursor: tombstone.final_screen.cursor,
+                text: None,
+                elements: None,
+                content_hash: None,
+            }),
+        ),
+        SnapshotFormat::Text => {
+            let text = tombstone.final_screen.text.unwrap_or_default();
+            let content = format_text_snapshot(
+                &text,
+                tombstone.final_screen.cursor.row,
+                tombstone.final_screen.cursor.col,
+                TermSize {
+                    cols: tombstone.final_screen.size.cols,
+                    rows: tombstone.final_screen.size.rows,
+                },
+            );
+            Response::success(
+                request_id,
+                ResponseData::Snapshot {
+                    format: SnapshotFormat::Text,
+                    content,
+                },
+            )
         }
     }
 }
@@ -1485,6 +1539,105 @@ mod tests {
         assert!(matches!(
             response.error.map(|error| error.code),
             Some(ErrorCode::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalized_session_serves_evidence_and_rejects_input() {
+        let sessions = Arc::new(SessionManager::new());
+        sessions
+            .create_session(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf recovered-evidence; exit 9".to_string(),
+                ],
+                Some("finalized".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("create exiting session");
+        sessions.spawn_cleaner();
+        timeout(Duration::from_secs(3), async {
+            while !sessions.is_empty().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("finalize session");
+
+        let shutdown = Arc::new(Notify::new());
+        let input = handle_request(
+            Request::new(
+                "input",
+                Command::Type {
+                    text: "nope".to_string(),
+                    session: Some("finalized".to_string()),
+                },
+            ),
+            sessions.clone(),
+            shutdown.clone(),
+        )
+        .await;
+        assert!(matches!(
+            input.error.map(|error| error.code),
+            Some(ErrorCode::SessionExited)
+        ));
+
+        let legacy_input = handle_request(
+            Request {
+                id: "legacy-input".to_string(),
+                command: Command::Type {
+                    text: "nope".to_string(),
+                    session: Some("finalized".to_string()),
+                },
+                protocol: 0,
+            },
+            sessions.clone(),
+            shutdown.clone(),
+        )
+        .await;
+        assert!(matches!(
+            legacy_input.error.map(|error| error.code),
+            Some(ErrorCode::InvalidInput)
+        ));
+
+        let snapshot = handle_request(
+            Request::new(
+                "snapshot",
+                Command::Snapshot {
+                    session: Some("finalized".to_string()),
+                    format: Some(SnapshotFormat::Full),
+                    await_change: None,
+                    settle_ms: 0,
+                    timeout_ms: 1000,
+                },
+            ),
+            sessions.clone(),
+            shutdown.clone(),
+        )
+        .await;
+        assert!(matches!(
+            snapshot.data,
+            Some(ResponseData::ScreenState(ScreenState { text: Some(text), .. }))
+                if text.contains("recovered-evidence")
+        ));
+
+        let logs = handle_request(
+            Request::new(
+                "logs",
+                Command::Logs {
+                    session: Some("finalized".to_string()),
+                },
+            ),
+            sessions,
+            shutdown,
+        )
+        .await;
+        assert!(matches!(
+            logs.data,
+            Some(ResponseData::Logs { bytes, .. }) if bytes.ends_with(b"recovered-evidence")
         ));
     }
 

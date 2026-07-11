@@ -8,6 +8,7 @@ use std::fmt;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     SessionNotFound,
+    SessionExited,
     CommandFailed,
     InvalidInput,
     InternalError,
@@ -17,6 +18,7 @@ impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ErrorCode::SessionNotFound => write!(f, "SESSION_NOT_FOUND"),
+            ErrorCode::SessionExited => write!(f, "SESSION_EXITED"),
             ErrorCode::CommandFailed => write!(f, "COMMAND_FAILED"),
             ErrorCode::InvalidInput => write!(f, "INVALID_INPUT"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
@@ -49,7 +51,21 @@ impl ApiError {
         Self {
             code: ErrorCode::SessionNotFound,
             message: format!("Session '{}' not found", session_id),
-            suggestion: Some("Run 'pilotty list-sessions' to see available sessions".into()),
+            suggestion: Some(
+                "The session is unknown, expired, or the daemon restarted since it ended. Run 'pilotty list-sessions' to see live sessions."
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn session_exited(session_id: &str, status: &str) -> Self {
+        Self {
+            code: ErrorCode::SessionExited,
+            message: format!("Session '{}' exited ({})", session_id, status),
+            suggestion: Some(
+                "Run 'pilotty snapshot' or 'pilotty logs' for final evidence. 'pilotty status' reports exit metadata when available."
+                    .into(),
+            ),
         }
     }
 
@@ -342,6 +358,29 @@ mod tests {
         assert!(err.message.contains("protocol 1"));
         assert!(err.suggestion.as_deref().is_some_and(|suggestion| {
             suggestion.contains("pilotty stop") && suggestion.contains("retry")
+        }));
+    }
+
+    #[test]
+    fn session_exited_error_is_versioned_and_actionable() {
+        let err = ApiError::session_exited("editor", "exit code 7");
+
+        assert_eq!(err.code, ErrorCode::SessionExited);
+        assert_eq!(err.minimum_protocol(), crate::protocol::PROTOCOL_VERSION);
+        assert!(err.message.contains("editor"));
+        assert!(err.message.contains("exit code 7"));
+        assert!(err
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("pilotty status")));
+    }
+
+    #[test]
+    fn session_not_found_describes_expired_or_unknown_state() {
+        let err = ApiError::session_not_found("editor");
+
+        assert!(err.suggestion.as_deref().is_some_and(|suggestion| {
+            suggestion.contains("expired") && suggestion.contains("daemon restarted")
         }));
     }
 }

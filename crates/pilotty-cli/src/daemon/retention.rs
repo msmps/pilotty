@@ -72,6 +72,22 @@ impl RetentionRing {
     }
 }
 
+impl RetentionSnapshot {
+    pub(crate) fn into_tail(self, capacity: usize) -> Self {
+        let start = self.bytes.len().saturating_sub(capacity);
+        let bytes = self.bytes[start..].to_vec();
+        let retained_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let dropped_bytes = self.total_bytes.saturating_sub(retained_bytes);
+        Self {
+            bytes,
+            total_bytes: self.total_bytes,
+            retained_bytes,
+            dropped_bytes,
+            truncated: dropped_bytes > 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::daemon::retention::RetentionRing;
@@ -116,5 +132,19 @@ mod tests {
         assert_eq!(snapshot.retained_bytes, 0);
         assert_eq!(snapshot.dropped_bytes, 8);
         assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn tombstone_tail_preserves_total_accounting() {
+        let mut retention = RetentionRing::new(10);
+        retention.append(b"0123456789");
+
+        let tail = retention.snapshot().into_tail(4);
+
+        assert_eq!(tail.bytes, b"6789");
+        assert_eq!(tail.total_bytes, 10);
+        assert_eq!(tail.retained_bytes, 4);
+        assert_eq!(tail.dropped_bytes, 6);
+        assert!(tail.truncated);
     }
 }
