@@ -95,7 +95,6 @@ The `snapshot` command returns structured data about the terminal screen:
 ```json
 {
   "outcome": "immediate",
-  "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
   "text": "... plain text content ..."
@@ -113,7 +112,6 @@ See the **[GitHub repository](https://github.com/msmps/pilotty)** for full docum
 - All commands reference
 - Session management
 - Key combinations
-- UI element detection
 - AI agent workflow examples
 - Daemon architecture
 

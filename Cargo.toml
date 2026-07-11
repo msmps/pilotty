@@ -33,7 +33,6 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
-unicode-width = "0.2"
 
 # System
 libc = "0.2"

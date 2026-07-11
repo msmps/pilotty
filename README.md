@@ -210,16 +210,9 @@ The `snapshot` command returns structured data about the terminal screen:
 ```json
 {
   "outcome": "immediate",
-  "snapshot_id": 42,
   "size": { "cols": 80, "rows": 24 },
   "cursor": { "row": 5, "col": 10, "visible": true },
   "text": "Options: [x] Enable  [ ] Debug\nActions: [OK] [Cancel]",
-  "elements": [
-    { "kind": "toggle", "row": 0, "col": 9, "width": 3, "text": "[x]", "confidence": 1.0, "checked": true },
-    { "kind": "toggle", "row": 0, "col": 22, "width": 3, "text": "[ ]", "confidence": 1.0, "checked": false },
-    { "kind": "button", "row": 1, "col": 9, "width": 4, "text": "[OK]", "confidence": 0.8 },
-    { "kind": "button", "row": 1, "col": 14, "width": 8, "text": "[Cancel]", "confidence": 0.8 }
-  ],
   "content_hash": 12345678901234567890
 }
 ```
@@ -228,33 +221,6 @@ JSON snapshots always include an `outcome`: `immediate`, `changed`, `settled`,
 `deadline`, or `exited`. Deadline and exit outcomes return the latest available screen evidence
 instead of replacing it with an error. Exited captures include process exit metadata and
 whether the final output was completely drained.
-
-## UI Elements (Contextual)
-
-pilotty automatically detects interactive UI elements in terminal applications. Elements provide **read-only context** to help understand UI structure, with position data (row, col) for use with the click command.
-
-**Use keyboard navigation (`pilotty key Tab`, `pilotty key Enter`, `pilotty type "text"`) for reliable TUI interaction** rather than element-based actions, as UI element detection depends on visual patterns that may disappear after interaction.
-
-### Element Kinds
-
-| Kind | Detection Patterns | Confidence |
-|------|-------------------|------------|
-| **button** | Inverse video, `[OK]`, `<Cancel>` | 1.0 / 0.8 |
-| **input** | Cursor position, `____` underscores | 1.0 / 0.6 |
-| **toggle** | `[x]`, `[ ]`, `☑`, `☐` | 1.0 |
-
-### Element Fields
-
-| Field | Description |
-|-------|-------------|
-| `kind` | Element type: `button`, `input`, or `toggle` |
-| `row` | Row position (0-based) |
-| `col` | Column position (0-based) |
-| `width` | Width in terminal cells |
-| `text` | Text content of the element |
-| `confidence` | Detection confidence (0.0-1.0) |
-| `focused` | Whether element has focus (only present if true) |
-| `checked` | Toggle state (only present for toggles) |
 
 ### Wait for Screen Changes
 
@@ -334,19 +300,18 @@ fi
 ### Workflow Example
 
 ```bash
-# 1. Spawn a TUI with dialog elements
+# 1. Spawn a dialog
 pilotty spawn dialog --yesno "Continue?" 10 40
 
 # 2. Wait for dialog to render
 pilotty wait-for "Continue"
 
-# 3. Get snapshot with elements (for context)
-pilotty snapshot | jq '.elements'
-# Shows detected buttons, helps understand UI structure
+# 3. Inspect the visible screen
+pilotty snapshot --format text
 
-# 4. Navigate and interact with keyboard (reliable approach)
-pilotty key Tab      # Move to next element
-pilotty key Enter    # Activate selected element
+# 4. Navigate and interact with keyboard
+pilotty key Tab      # Move to the next control
+pilotty key Enter    # Activate the selected control
 ```
 
 ## Sessions

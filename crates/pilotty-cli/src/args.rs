@@ -8,7 +8,7 @@ const SESSION_HELP: &str = "Target session by name or ID [default: default]";
 ///
 /// Spawn TUI applications in managed PTY sessions and interact with them
 /// programmatically. Designed for AI agent consumption with structured
-/// JSON output and stable element references.
+/// JSON output and deterministic terminal input.
 #[derive(Debug, Parser)]
 #[command(name = "pilotty", version)]
 pub struct Cli {

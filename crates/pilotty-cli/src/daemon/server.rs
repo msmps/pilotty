@@ -856,14 +856,8 @@ async fn handle_snapshot(
     if let Some(baseline_hash) = await_change {
         loop {
             if output_closed {
-                match exited_live_snapshot_response(
-                    request_id,
-                    sessions,
-                    &session_id,
-                    &mut observer,
-                    format,
-                )
-                .await
+                match exited_live_snapshot_response(request_id, &session_id, &mut observer, format)
+                    .await
                 {
                     Ok(Some(response)) => return response,
                     Ok(None) if start.elapsed() < timeout => {
@@ -894,7 +888,7 @@ async fn handle_snapshot(
                 .await;
             }
 
-            let snapshot = observer.current(false).await;
+            let snapshot = observer.current().await;
 
             if snapshot.content_hash != baseline_hash {
                 debug!(
@@ -928,20 +922,14 @@ async fn handle_snapshot(
     // Phase 2: If settle_ms > 0, wait for screen stability
     if settle_ms > 0 {
         // Get fresh snapshot - don't rely on potentially stale hash from Phase 1
-        let snapshot = observer.current(false).await;
+        let snapshot = observer.current().await;
         let mut last_hash = snapshot.content_hash;
         let mut stable_since = Instant::now();
 
         loop {
             if output_closed {
-                match exited_live_snapshot_response(
-                    request_id,
-                    sessions,
-                    &session_id,
-                    &mut observer,
-                    format,
-                )
-                .await
+                match exited_live_snapshot_response(request_id, &session_id, &mut observer, format)
+                    .await
                 {
                     Ok(Some(response)) => return response,
                     Ok(None) if start.elapsed() < timeout => {
@@ -986,7 +974,7 @@ async fn handle_snapshot(
             let wait = remaining.min(until_settled);
             match observer.wait_for_update(wait).await {
                 ObservationEvent::Updated => {
-                    let snapshot = observer.current(false).await;
+                    let snapshot = observer.current().await;
                     if snapshot.content_hash != last_hash {
                         last_hash = snapshot.content_hash;
                         stable_since = Instant::now();
@@ -1017,7 +1005,6 @@ async fn handle_snapshot(
     };
     live_snapshot_response(
         request_id,
-        sessions,
         &session_id,
         &mut observer,
         format,
@@ -1038,24 +1025,21 @@ struct CaptureDetails {
 
 async fn live_snapshot_response(
     request_id: &str,
-    sessions: &SessionManager,
     session_id: &SessionId,
     observer: &mut SessionObserver,
     format: SnapshotFormat,
     details: CaptureDetails,
 ) -> Response {
-    let with_elements = matches!(format, SnapshotFormat::Full);
-    let snapshot = observer.current(with_elements).await;
+    let snapshot = observer.current().await;
     debug!(
         "Captured session {} at revision {}",
         session_id, snapshot.revision
     );
-    snapshot_response(request_id, sessions, snapshot, format, details)
+    snapshot_response(request_id, snapshot, format, details)
 }
 
 fn snapshot_response(
     request_id: &str,
-    sessions: &SessionManager,
     snapshot: SnapshotData,
     format: SnapshotFormat,
     details: CaptureDetails,
@@ -1078,9 +1062,7 @@ fn snapshot_response(
             )
         }
         SnapshotFormat::Full => {
-            let snapshot_id = sessions.next_snapshot_id();
             let screen_state = ScreenState {
-                snapshot_id,
                 size: TerminalSize {
                     cols: snapshot.size.cols,
                     rows: snapshot.size.rows,
@@ -1091,7 +1073,6 @@ fn snapshot_response(
                     visible: snapshot.cursor_visible,
                 },
                 text: Some(snapshot.text),
-                elements: snapshot.elements,
                 content_hash: Some(snapshot.content_hash),
             };
             Response::success(
@@ -1105,9 +1086,7 @@ fn snapshot_response(
             )
         }
         SnapshotFormat::Compact => {
-            let snapshot_id = sessions.next_snapshot_id();
             let screen_state = ScreenState {
-                snapshot_id,
                 size: TerminalSize {
                     cols: snapshot.size.cols,
                     rows: snapshot.size.rows,
@@ -1118,7 +1097,6 @@ fn snapshot_response(
                     visible: snapshot.cursor_visible,
                 },
                 text: None,
-                elements: None,
                 content_hash: None,
             };
             Response::success(
@@ -1154,9 +1132,7 @@ async fn snapshot_deadline_response(
     }
 
     if output_closed {
-        match exited_live_snapshot_response(request_id, sessions, session_id, observer, format)
-            .await
-        {
+        match exited_live_snapshot_response(request_id, session_id, observer, format).await {
             Ok(Some(response)) => return response,
             Ok(None) => {}
             Err(response) => return response,
@@ -1170,7 +1146,6 @@ async fn snapshot_deadline_response(
     };
     live_snapshot_response(
         request_id,
-        sessions,
         session_id,
         observer,
         format,
@@ -1191,7 +1166,6 @@ struct SnapshotDeadline {
 
 async fn exited_live_snapshot_response(
     request_id: &str,
-    sessions: &SessionManager,
     session_id: &SessionId,
     observer: &mut SessionObserver,
     format: SnapshotFormat,
@@ -1206,7 +1180,6 @@ async fn exited_live_snapshot_response(
     Ok(Some(
         live_snapshot_response(
             request_id,
-            sessions,
             session_id,
             observer,
             format,
@@ -1269,11 +1242,9 @@ fn exited_snapshot_response(
             request_id,
             ResponseData::ScreenState(ScreenCapture {
                 screen: ScreenState {
-                    snapshot_id: tombstone.final_screen.snapshot_id,
                     size: tombstone.final_screen.size,
                     cursor: tombstone.final_screen.cursor,
                     text: None,
-                    elements: None,
                     content_hash: None,
                 },
                 outcome: details.outcome,
@@ -1733,8 +1704,8 @@ async fn handle_wait_for(
             );
         }
 
-        // Get current screen text (no elements needed for wait_for)
-        let snapshot = observer.current(false).await;
+        // Get current screen text.
+        let snapshot = observer.current().await;
 
         // Check for match
         let matched = if let Some(ref re) = compiled_regex {
@@ -2775,12 +2746,6 @@ mod tests {
 
         // Verify ScreenState structure
         if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
-            // Check snapshot_id is non-zero
-            assert!(
-                screen_state.screen.snapshot_id > 0,
-                "snapshot_id should be positive"
-            );
-
             // Check size
             assert_eq!(
                 screen_state.screen.size.cols, 80,
@@ -3856,11 +3821,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// Regression test: await_change must actually wait. Before the fix, the
-    /// wait loop polled with `with_elements = false`, which returned
-    /// `content_hash: None`, so `None != Some(baseline)` broke the loop on the
-    /// first iteration and await_change returned instantly on an unchanged
-    /// screen.
+    /// Regression test: await_change must actually wait on an unchanged screen.
     #[tokio::test]
     async fn snapshot_await_change_deadline_returns_latest_evidence() {
         let temp_dir = std::env::temp_dir();
@@ -4172,180 +4133,5 @@ mod tests {
         server_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);
-    }
-
-    #[tokio::test]
-    async fn test_snapshot_with_elements() {
-        use pilotty_core::elements::ElementKind;
-
-        let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("pilotty-elem-{}.sock", std::process::id()));
-        let pid_path = socket_path.with_extension("pid");
-
-        let server = DaemonServer::bind_to(socket_path.clone(), pid_path.clone())
-            .await
-            .expect("Failed to bind server");
-
-        let server_handle = tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(5), server.run()).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .expect("Failed to connect");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-
-        // Spawn a session with output containing detectable elements:
-        // - [OK] and [Cancel] → Buttons (bracket pattern, confidence 0.8)
-        // - [x] and [ ] → Toggles (checkbox pattern, confidence 1.0)
-        let spawn_request = Request {
-            protocol: PROTOCOL_VERSION,
-            id: "spawn-elem".to_string(),
-            command: Command::Spawn {
-                command: vec![
-                    "printf".to_string(),
-                    "Options: [x] Enable  [ ] Debug\nActions: [OK] [Cancel]\n".to_string(),
-                ],
-                session_name: Some("elem-test".to_string()),
-                cwd: None,
-                retain_bytes: None,
-            },
-        };
-        let request_json = serde_json::to_string(&spawn_request).unwrap();
-        writer
-            .write_all(request_json.as_bytes())
-            .await
-            .expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        let mut response_line = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        // Give printf time to complete
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Request snapshot with Full format (includes elements)
-        let snap_request = Request {
-            protocol: PROTOCOL_VERSION,
-            id: "snap-elem".to_string(),
-            command: Command::Snapshot {
-                session: Some("elem-test".to_string()),
-                format: SnapshotFormat::Full,
-                await_change: None,
-                settle_ms: 0,
-                timeout_ms: 30000,
-            },
-        };
-        let snap_json = serde_json::to_string(&snap_request).unwrap();
-        writer.write_all(snap_json.as_bytes()).await.expect("write");
-        writer.write_all(b"\n").await.expect("newline");
-        writer.flush().await.expect("flush");
-
-        response_line.clear();
-        timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-            .await
-            .expect("timeout")
-            .expect("read");
-
-        let snap_response: Response =
-            serde_json::from_str(&response_line).expect("parse snap response");
-        assert!(snap_response.success, "Snapshot should succeed");
-
-        // Verify ScreenState with elements
-        if let Some(ResponseData::ScreenState(screen_state)) = snap_response.data {
-            // Full format includes text
-            assert!(
-                screen_state.screen.text.is_some(),
-                "Full format should include text"
-            );
-
-            // Full format SHOULD include elements
-            assert!(
-                screen_state.screen.elements.is_some(),
-                "Full format should include elements"
-            );
-
-            // Full format SHOULD include content_hash
-            assert!(
-                screen_state.screen.content_hash.is_some(),
-                "Full format should include content_hash"
-            );
-
-            let elements = screen_state.screen.elements.unwrap();
-
-            // Should detect at least the toggles (checkboxes are high confidence)
-            // [x] -> Toggle checked=true, [ ] -> Toggle checked=false
-            let toggles: Vec<_> = elements
-                .iter()
-                .filter(|e| e.kind == ElementKind::Toggle)
-                .collect();
-            assert!(
-                toggles.len() >= 2,
-                "Should detect at least 2 toggles, found {}",
-                toggles.len()
-            );
-
-            // Verify toggle states
-            let checked_toggle = toggles.iter().find(|t| t.checked == Some(true));
-            let unchecked_toggle = toggles.iter().find(|t| t.checked == Some(false));
-            assert!(
-                checked_toggle.is_some(),
-                "Should have a checked toggle ([x])"
-            );
-            assert!(
-                unchecked_toggle.is_some(),
-                "Should have an unchecked toggle ([ ])"
-            );
-
-            // Check toggle confidence is 1.0 (checkbox pattern)
-            for toggle in &toggles {
-                assert!(
-                    (toggle.confidence - 1.0).abs() < f32::EPSILON,
-                    "Toggle confidence should be 1.0, got {}",
-                    toggle.confidence
-                );
-            }
-
-            // May also detect [OK] and [Cancel] as buttons
-            let buttons: Vec<_> = elements
-                .iter()
-                .filter(|e| e.kind == ElementKind::Button)
-                .collect();
-            // Buttons have 0.8 confidence (bracket pattern)
-            for button in &buttons {
-                assert!(
-                    (button.confidence - 0.8).abs() < f32::EPSILON,
-                    "Button confidence should be 0.8, got {}",
-                    button.confidence
-                );
-            }
-
-            // Verify JSON serialization is clean (check raw response)
-            // - Non-focused elements should NOT have "focused" in their JSON
-            // - Buttons should NOT have "checked" in their JSON
-            let raw_json = &response_line;
-            // Count occurrences of "focused" - should only appear for focused elements
-            let focused_count = raw_json.matches("\"focused\"").count();
-            let elements_with_focus = elements.iter().filter(|e| e.focused).count();
-            assert_eq!(
-                focused_count, elements_with_focus,
-                "JSON should only include 'focused' for focused elements"
-            );
-        } else {
-            panic!(
-                "Expected ScreenState response data, got: {:?}",
-                snap_response.data
-            );
-        }
-
-        server_handle.abort();
-        let _ = std::fs::remove_file(&socket_path);
     }
 }

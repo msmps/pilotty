@@ -1,7 +1,7 @@
 //! Screen state capture and change detection.
 //!
 //! This module provides types for capturing terminal screen state, including
-//! text content, cursor position, and detected UI elements.
+//! text content and cursor position.
 //!
 //! # Snapshot Formats
 //!
@@ -9,23 +9,21 @@
 //!
 //! | Format | Content | Use Case |
 //! |--------|---------|----------|
-//! | **Full** | text + elements + hash | Complete state for new screens |
+//! | **Full** | text + hash | Complete screen state |
 //! | **Compact** | metadata only | Quick status checks |
 //!
 //! # Change Detection
 //!
 //! The `content_hash` field provides efficient change detection. Agents can
-//! compare hashes across snapshots without parsing the full element list:
+//! compare hashes across snapshots without comparing the full screen text:
 //!
 //! ```ignore
 //! if new_snapshot.content_hash != old_snapshot.content_hash {
-//!     // Screen changed, re-analyze elements
+//!     // Screen changed, inspect the new text
 //! }
 //! ```
 
 use serde::{Deserialize, Serialize};
-
-use crate::elements::Element;
 
 /// Terminal dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,25 +43,16 @@ pub struct CursorState {
 /// Complete screen state snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScreenState {
-    pub snapshot_id: u64,
     pub size: TerminalSize,
     pub cursor: CursorState,
     /// Plain text content of the screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// Detected interactive UI elements.
-    ///
-    /// Elements are detected using visual style segmentation and pattern
-    /// classification. Each element includes its position (row, col) for
-    /// interaction via the click command.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub elements: Option<Vec<Element>>,
     /// Hash of screen content for change detection.
     ///
     /// Computed from the screen text using a fast non-cryptographic hash.
-    /// Present when `elements` is requested (`with_elements=true`).
-    /// Agents can compare hashes across snapshots to detect screen changes
-    /// without parsing the full element list.
+    /// Present in full snapshots. Agents can compare hashes across snapshots
+    /// to detect screen changes without comparing the full text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<u64>,
 }
@@ -71,7 +60,6 @@ pub struct ScreenState {
 impl ScreenState {
     pub fn empty(cols: u16, rows: u16) -> Self {
         Self {
-            snapshot_id: 0,
             size: TerminalSize { cols, rows },
             cursor: CursorState {
                 row: 0,
@@ -79,7 +67,6 @@ impl ScreenState {
                 visible: true,
             },
             text: None,
-            elements: None,
             content_hash: None,
         }
     }

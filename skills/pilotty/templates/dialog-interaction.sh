@@ -1,6 +1,6 @@
 #!/bin/bash
 # Template: Interact with dialog/whiptail prompts
-# Demonstrates handling various dialog types with element detection
+# Demonstrates handling various dialog types with screen snapshots
 #
 # Usage: ./dialog-interaction.sh
 # Requires: dialog or whiptail installed
@@ -33,9 +33,8 @@ pilotty spawn --name "$SESSION_NAME" dialog --yesno "Do you want to continue?" 1
 # Wait for dialog to render
 pilotty wait-for -s "$SESSION_NAME" "continue" -t 5000 >/dev/null
 
-# Show detected elements
-echo "Detected elements:"
-pilotty snapshot -s "$SESSION_NAME" | jq -r '.elements[] | "  \(.kind) \(.text) at (\(.row),\(.col))"'
+# Inspect the visible prompt
+pilotty snapshot -s "$SESSION_NAME" --format text
 
 # Select Yes using keyboard (Enter selects the default button)
 pilotty key -s "$SESSION_NAME" Enter >/dev/null
@@ -63,9 +62,9 @@ pilotty key -s "$SESSION_NAME" Enter >/dev/null # Select
 sleep 0.5
 echo "Selected: Option Three (via arrow keys + Enter)"
 
-# --- Checklist Dialog with Element Detection ---
+# --- Checklist Dialog ---
 echo ""
-echo "3. Checklist Dialog (with element detection)"
+echo "3. Checklist Dialog"
 
 pilotty spawn --name "$SESSION_NAME" dialog --checklist "Select items:" 15 50 4 \
   1 "Item A" off \
@@ -75,9 +74,10 @@ pilotty spawn --name "$SESSION_NAME" dialog --checklist "Select items:" 15 50 4 
 
 pilotty wait-for -s "$SESSION_NAME" "Select" -t 5000 >/dev/null
 
-# Show initial toggle states
-echo "Initial toggle states:"
-pilotty snapshot -s "$SESSION_NAME" | jq -r '.elements[] | select(.kind == "toggle") | "  \(.text) at (\(.row),\(.col)) checked=\(.checked)"'
+# Capture the initial screen
+SNAPSHOT=$(pilotty snapshot -s "$SESSION_NAME")
+echo "$SNAPSHOT" | jq -r '.text'
+HASH=$(echo "$SNAPSHOT" | jq -r '.content_hash')
 
 # Toggle items with Space
 pilotty key -s "$SESSION_NAME" Space >/dev/null      # Toggle Item A
@@ -85,9 +85,9 @@ pilotty key -s "$SESSION_NAME" Down >/dev/null
 pilotty key -s "$SESSION_NAME" Down >/dev/null
 pilotty key -s "$SESSION_NAME" Space >/dev/null      # Toggle Item C
 
-# Show updated toggle states
+# Show the updated screen
 echo "After toggling:"
-pilotty snapshot -s "$SESSION_NAME" | jq -r '.elements[] | select(.kind == "toggle") | "  \(.text) at (\(.row),\(.col)) checked=\(.checked)"'
+pilotty snapshot -s "$SESSION_NAME" --await-change "$HASH" | jq -r '.text'
 
 pilotty key -s "$SESSION_NAME" Enter >/dev/null      # Confirm
 
@@ -102,9 +102,8 @@ pilotty spawn --name "$SESSION_NAME" dialog --inputbox "Enter your name:" 10 40 
 
 pilotty wait-for -s "$SESSION_NAME" "name" -t 5000 >/dev/null
 
-# Show detected input element
-echo "Detected input element:"
-pilotty snapshot -s "$SESSION_NAME" | jq -r '.elements[] | select(.kind == "input") | "  \(.kind) at (\(.row),\(.col)) width=\(.width)"'
+# Inspect the input prompt
+pilotty snapshot -s "$SESSION_NAME" --format text
 
 # Type input
 pilotty type -s "$SESSION_NAME" "Agent Smith"
@@ -121,9 +120,8 @@ pilotty spawn --name "$SESSION_NAME" dialog --msgbox "Demo complete!" 10 40 >/de
 
 pilotty wait-for -s "$SESSION_NAME" "complete" -t 5000 >/dev/null
 
-# Show button element
-echo "Detected button:"
-pilotty snapshot -s "$SESSION_NAME" | jq -r '.elements[] | select(.kind == "button" or .kind == "input") | "  \(.kind) \(.text) at (\(.row),\(.col))"'
+# Inspect the message box
+pilotty snapshot -s "$SESSION_NAME" --format text
 
 # Dismiss with Enter
 pilotty key -s "$SESSION_NAME" Enter >/dev/null
@@ -134,7 +132,6 @@ echo ""
 echo "=== Demo Complete ==="
 echo ""
 echo "Key takeaways:"
-echo "  - Use snapshot | jq '.elements' to see detected UI elements"
-echo "  - Toggles have 'checked' field for state tracking"
+echo "  - Use snapshot --format text to inspect the visible screen"
+echo "  - Compare content_hash values or use --await-change after actions"
 echo "  - Use keyboard (Tab, Space, Enter, arrows) for reliable navigation"
-echo "  - content_hash can detect screen changes between snapshots"

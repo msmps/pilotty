@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shipped_v1_daemon_is_probed_and_current_command_is_rejected_before_transmission() {
+    async fn shipped_v1_daemon_is_probed_and_output_is_rejected_before_transmission() {
         let socket_path =
             std::env::temp_dir().join(format!("pilotty-probe-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
@@ -355,21 +355,20 @@ mod tests {
             stream,
             daemon_protocol: None,
         };
+        let command = Command::Output {
+            session: None,
+            ansi: false,
+        };
+        let required_protocol = command.minimum_protocol();
         let error = client
-            .request(Request::new(
-                "output-request",
-                Command::Output {
-                    session: None,
-                    ansi: false,
-                },
-            ))
+            .request(Request::new("output-request", command))
             .await
             .expect_err("old daemon must be rejected");
 
         let message = error.to_string();
         assert!(message.contains("speaks protocol 1"), "got: {message}");
         assert!(
-            message.contains(&format!("requires protocol {PROTOCOL_VERSION}")),
+            message.contains(&format!("requires protocol {required_protocol}")),
             "got: {message}"
         );
         peer.await.expect("protocol fixture task");
