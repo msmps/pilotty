@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
 
 /// Terminal size in columns and rows.
@@ -104,6 +104,8 @@ const READ_BUFFER_SIZE: usize = 4096;
 pub struct AsyncPtyHandle {
     /// Sender for writing to PTY stdin.
     write_tx: mpsc::Sender<Vec<u8>>,
+    /// Wakes pending input sends when session shutdown begins.
+    write_shutdown: watch::Sender<bool>,
     /// Flag to signal shutdown.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Master PTY for resize operations (sends SIGWINCH).
@@ -131,6 +133,7 @@ impl AsyncPtyHandle {
 
         // Create channels
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (write_shutdown, _write_shutdown_rx) = watch::channel(false);
         let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(64);
 
         // Spawn reader thread
@@ -147,6 +150,7 @@ impl AsyncPtyHandle {
         Ok((
             Self {
                 write_tx,
+                write_shutdown,
                 shutdown,
                 master: std::sync::Mutex::new(master),
                 child: std::sync::Mutex::new(child),
@@ -169,10 +173,18 @@ impl AsyncPtyHandle {
     }
     /// Send bytes to the PTY stdin.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        self.write_tx
-            .send(data.to_vec())
-            .await
-            .context("Failed to send to PTY input channel")
+        let mut shutdown = self.write_shutdown.subscribe();
+        if *shutdown.borrow() {
+            anyhow::bail!("PTY input is shutting down");
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => anyhow::bail!("PTY input is shutting down"),
+            result = self.write_tx.send(data.to_vec()) => {
+                result.context("Failed to send to PTY input channel")
+            }
+        }
     }
 
     /// Return the child process exit status when it has exited.
@@ -189,6 +201,8 @@ impl AsyncPtyHandle {
     /// The session runtime owns the read receiver and is responsible for ending its
     /// pump before dropping this handle.
     pub fn terminate(&self) {
+        self.write_shutdown.send_replace(true);
+
         // Kill the child process first to prevent orphaned processes
         if let Ok(mut child) = self.child.lock() {
             if let Err(e) = child.kill() {
@@ -265,6 +279,8 @@ impl AsyncPtyHandle {
 
 impl Drop for AsyncPtyHandle {
     fn drop(&mut self) {
+        self.write_shutdown.send_replace(true);
+
         // Kill the child process first to prevent orphaned processes.
         // This mirrors the logic in shutdown() but is synchronous since Drop can't be async.
         if let Ok(mut child) = self.child.lock() {
@@ -448,6 +464,21 @@ mod tests {
 
         // Shutdown should complete without hanging
         handle.terminate();
+    }
+
+    #[tokio::test]
+    async fn write_is_rejected_after_terminate() {
+        let session =
+            PtySession::spawn(&["cat".to_string()], TermSize::default(), None).expect("spawn cat");
+        let (handle, _read_rx) = AsyncPtyHandle::new(session).expect("create async handle");
+
+        handle.terminate();
+
+        let error = handle
+            .write(b"must-not-be-queued")
+            .await
+            .expect_err("writes must stop when PTY shutdown begins");
+        assert!(error.to_string().contains("shutting down"));
     }
 
     #[tokio::test]
