@@ -235,7 +235,8 @@ impl DaemonClient {
 mod tests {
     use super::*;
     use crate::daemon::server::DaemonServer;
-    use pilotty_core::protocol::{Command, PROTOCOL_VERSION};
+    use pilotty_core::protocol::{Command, ResponseData, PROTOCOL_VERSION};
+    use tokio::net::UnixListener;
 
     #[tokio::test]
     async fn test_client_connects_to_running_daemon() {
@@ -303,5 +304,67 @@ mod tests {
             protocol_action(Some(PROTOCOL_VERSION), PROTOCOL_VERSION),
             ProtocolAction::Send
         );
+    }
+
+    #[tokio::test]
+    async fn old_daemon_is_probed_and_logs_is_rejected_before_transmission() {
+        let socket_path =
+            std::env::temp_dir().join(format!("pilotty-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind protocol fixture");
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read probe");
+            let probe: Request = serde_json::from_str(&line).expect("parse probe");
+            assert_eq!(probe.command, Command::ListSessions);
+
+            let response = Response {
+                id: probe.id,
+                success: true,
+                data: Some(ResponseData::Sessions { sessions: vec![] }),
+                error: None,
+                protocol: LEGACY_PROTOCOL_VERSION,
+            };
+            writer
+                .write_all(
+                    serde_json::to_string(&response)
+                        .expect("serialize response")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+            writer.flush().await.expect("flush response");
+
+            line.clear();
+            assert!(
+                timeout(Duration::from_millis(100), reader.read_line(&mut line))
+                    .await
+                    .is_err(),
+                "version-gated command must not reach an old daemon"
+            );
+        });
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to protocol fixture");
+        let mut client = DaemonClient {
+            stream,
+            daemon_protocol: None,
+        };
+        let error = client
+            .request(Request::new(
+                "logs-request",
+                Command::Logs { session: None },
+            ))
+            .await
+            .expect_err("old daemon must be rejected");
+
+        assert!(error.to_string().contains("protocol 1"));
+        peer.await.expect("protocol fixture task");
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

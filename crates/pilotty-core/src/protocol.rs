@@ -77,6 +77,10 @@ pub enum Command {
         /// must be an existing directory. If not provided by the client, the
         /// process inherits the daemon's working directory.
         cwd: Option<String>,
+        /// Maximum raw output bytes retained for this session.
+        /// Uses the daemon default when omitted.
+        #[serde(default)]
+        retain_bytes: Option<u64>,
     },
     /// Kill a session.
     Kill { session: Option<String> },
@@ -127,6 +131,8 @@ pub enum Command {
     },
     /// List all active sessions.
     ListSessions,
+    /// Get the retained raw output for a session.
+    Logs { session: Option<String> },
     /// Resize the terminal.
     Resize {
         cols: u16,
@@ -151,7 +157,14 @@ impl Command {
     /// compatibility before it can compile.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
-            Self::Spawn { .. }
+            Self::Spawn {
+                retain_bytes: Some(_),
+                ..
+            }
+            | Self::Logs { .. } => PROTOCOL_VERSION,
+            Self::Spawn {
+                retain_bytes: None, ..
+            }
             | Self::Kill { .. }
             | Self::Snapshot { .. }
             | Self::Type { .. }
@@ -261,6 +274,14 @@ pub enum ResponseData {
     },
     /// Generic success message.
     Ok { message: String },
+    /// Bounded raw output retained for a session.
+    Logs {
+        bytes: Vec<u8>,
+        total_bytes: u64,
+        retained_bytes: u64,
+        dropped_bytes: u64,
+        truncated: bool,
+    },
 }
 
 impl ResponseData {
@@ -270,6 +291,7 @@ impl ResponseData {
     /// older client.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
+            Self::Logs { .. } => PROTOCOL_VERSION,
             Self::ScreenState(_)
             | Self::Snapshot { .. }
             | Self::SessionCreated { .. }
@@ -383,5 +405,60 @@ mod tests {
 
         assert_eq!(command.minimum_protocol(), 0);
         assert_eq!(response.minimum_protocol(), 0);
+    }
+
+    #[test]
+    fn retention_commands_require_current_protocol() {
+        let plain_spawn = Command::Spawn {
+            command: vec!["sh".to_string()],
+            session_name: None,
+            cwd: None,
+            retain_bytes: None,
+        };
+        let configured_spawn = Command::Spawn {
+            command: vec!["sh".to_string()],
+            session_name: None,
+            cwd: None,
+            retain_bytes: Some(1024),
+        };
+
+        assert_eq!(plain_spawn.minimum_protocol(), LEGACY_PROTOCOL_VERSION);
+        assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_VERSION);
+        assert_eq!(
+            Command::Logs { session: None }.minimum_protocol(),
+            PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn logs_response_requires_current_protocol_and_preserves_raw_bytes() {
+        let response = ResponseData::Logs {
+            bytes: vec![0, 27, 255],
+            total_bytes: 9,
+            retained_bytes: 3,
+            dropped_bytes: 6,
+            truncated: true,
+        };
+
+        assert_eq!(response.minimum_protocol(), PROTOCOL_VERSION);
+        let json = serde_json::to_string(&response).expect("serialize logs response");
+        let decoded: ResponseData = serde_json::from_str(&json).expect("deserialize logs response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn legacy_spawn_without_retention_field_uses_daemon_default() {
+        let json = r#"{"action":"spawn","command":["sh"],"session_name":null,"cwd":null}"#;
+        let command: Command = serde_json::from_str(json).expect("deserialize legacy spawn");
+
+        assert_eq!(
+            command,
+            Command::Spawn {
+                command: vec!["sh".to_string()],
+                session_name: None,
+                cwd: None,
+                retain_bytes: None,
+            }
+        );
     }
 }

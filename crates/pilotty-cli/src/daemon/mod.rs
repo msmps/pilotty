@@ -3,6 +3,7 @@
 pub mod client;
 pub mod paths;
 pub mod pty;
+pub mod retention;
 pub mod server;
 pub mod session;
 pub mod terminal;
