@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use pilotty_core::protocol::{Request, Response};
+use pilotty_core::protocol::{Request, Response, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -155,6 +155,15 @@ impl DaemonClient {
 
         let response: Response =
             serde_json::from_str(&response_line).context("Failed to parse response")?;
+
+        if response.protocol < PROTOCOL_VERSION {
+            eprintln!(
+                "warning: the running daemon speaks protocol {} but this client speaks {}; \
+                 run 'pilotty stop' so the daemon restarts with the current binary",
+                response.protocol, PROTOCOL_VERSION
+            );
+        }
+
         Ok(response)
     }
 }
@@ -163,7 +172,7 @@ impl DaemonClient {
 mod tests {
     use super::*;
     use crate::daemon::server::DaemonServer;
-    use pilotty_core::protocol::Command;
+    use pilotty_core::protocol::{Command, PROTOCOL_VERSION};
 
     #[tokio::test]
     async fn test_client_connects_to_running_daemon() {
@@ -192,6 +201,7 @@ mod tests {
 
         // Send request
         let request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "client-test-1".to_string(),
             command: Command::ListSessions,
         };

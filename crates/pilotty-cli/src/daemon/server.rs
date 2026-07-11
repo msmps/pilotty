@@ -1308,7 +1308,7 @@ async fn handle_shutdown(
 mod tests {
     use super::*;
     use pilotty_core::error::ErrorCode;
-    use pilotty_core::protocol::Command;
+    use pilotty_core::protocol::{Command, PROTOCOL_VERSION};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -1344,6 +1344,7 @@ mod tests {
 
         // Send a request
         let request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "test-1".to_string(),
             command: Command::ListSessions,
         };
@@ -1436,6 +1437,7 @@ mod tests {
         let mut reader = BufReader::new(reader);
 
         let request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "scroll-1".to_string(),
             command: Command::Scroll {
                 direction: pilotty_core::protocol::ScrollDirection::Down,
@@ -1494,6 +1496,7 @@ mod tests {
 
         // Spawn a session running echo
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "hello from test".to_string()],
@@ -1525,6 +1528,7 @@ mod tests {
 
         // Take a snapshot
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-1".to_string(),
             command: Command::Snapshot {
                 session: Some("test-snap".to_string()),
@@ -1600,6 +1604,7 @@ mod tests {
 
         // Spawn a session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "full format test".to_string()],
@@ -1625,6 +1630,7 @@ mod tests {
 
         // Request snapshot with Full format
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-full".to_string(),
             command: Command::Snapshot {
                 session: Some("full-test".to_string()),
@@ -1717,6 +1723,7 @@ mod tests {
 
         // Spawn a cat session (echoes input)
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -1746,6 +1753,7 @@ mod tests {
 
         // Type some text
         let type_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "type-1".to_string(),
             command: Command::Type {
                 text: "Hello World".to_string(),
@@ -1772,6 +1780,7 @@ mod tests {
 
         // Take a snapshot and verify the text appears
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-1".to_string(),
             command: Command::Snapshot {
                 session: Some("type-test".to_string()),
@@ -1835,6 +1844,7 @@ mod tests {
 
         // Spawn a cat session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -1860,6 +1870,7 @@ mod tests {
 
         // Send a key
         let key_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "key-1".to_string(),
             command: Command::Key {
                 key: "Enter".to_string(),
@@ -1884,6 +1895,7 @@ mod tests {
 
         // Test Ctrl+C (which will terminate cat)
         let ctrlc_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "key-2".to_string(),
             command: Command::Key {
                 key: "Ctrl+C".to_string(),
@@ -1938,6 +1950,7 @@ mod tests {
 
         // Try to send a key with delay exceeding MAX_KEY_DELAY_MS (10000)
         let request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "key-delay-1".to_string(),
             command: Command::Key {
                 key: "a b".to_string(),
@@ -1994,6 +2007,7 @@ mod tests {
 
         // Spawn a session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -2019,6 +2033,7 @@ mod tests {
 
         // Click at coordinates (row 5, col 10)
         let click_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "click-1".to_string(),
             command: Command::Click {
                 row: 5,
@@ -2089,6 +2104,7 @@ mod tests {
 
         // Spawn a session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -2114,6 +2130,7 @@ mod tests {
 
         // Scroll up
         let scroll_up_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "scroll-1".to_string(),
             command: Command::Scroll {
                 direction: ScrollDirection::Up,
@@ -2141,6 +2158,7 @@ mod tests {
 
         // Scroll down
         let scroll_down_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "scroll-2".to_string(),
             command: Command::Scroll {
                 direction: ScrollDirection::Down,
@@ -2194,6 +2212,7 @@ mod tests {
 
         // Spawn a session that outputs text
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "hello world marker".to_string()],
@@ -2220,6 +2239,7 @@ mod tests {
 
         // Wait for the text
         let wait_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "wait-1".to_string(),
             command: Command::WaitFor {
                 pattern: "marker".to_string(),
@@ -2285,6 +2305,7 @@ mod tests {
 
         // Spawn a session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "version 1.2.3 ready".to_string()],
@@ -2310,6 +2331,7 @@ mod tests {
 
         // Wait for regex pattern (version number)
         let wait_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "wait-re".to_string(),
             command: Command::WaitFor {
                 pattern: r"version \d+\.\d+\.\d+".to_string(),
@@ -2375,6 +2397,7 @@ mod tests {
         // We need a process that stays alive so the session isn't cleaned up
         // before the wait-for timeout occurs.
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -2400,6 +2423,7 @@ mod tests {
 
         // Wait for text that won't appear (short timeout)
         let wait_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "wait-to".to_string(),
             command: Command::WaitFor {
                 pattern: "nonexistent pattern xyz".to_string(),
@@ -2463,6 +2487,7 @@ mod tests {
 
         // Spawn a session
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["echo".to_string(), "test".to_string()],
@@ -2486,6 +2511,7 @@ mod tests {
 
         // Try invalid regex
         let wait_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "wait-bad".to_string(),
             command: Command::WaitFor {
                 pattern: "[invalid(regex".to_string(), // Unbalanced brackets
@@ -2552,6 +2578,7 @@ mod tests {
 
         // Spawn cat (echoes input)
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -2577,6 +2604,7 @@ mod tests {
 
         // Take baseline snapshot to get initial hash
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-baseline".to_string(),
             command: Command::Snapshot {
                 session: Some("await-test".to_string()),
@@ -2611,6 +2639,7 @@ mod tests {
 
         // Type something to change the screen
         let type_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "type-1".to_string(),
             command: Command::Type {
                 text: "hello".to_string(),
@@ -2631,6 +2660,7 @@ mod tests {
         // Request snapshot with await_change - should detect the change
         let start = std::time::Instant::now();
         let await_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-await".to_string(),
             command: Command::Snapshot {
                 session: Some("await-test".to_string()),
@@ -2716,6 +2746,7 @@ mod tests {
 
         // Spawn cat with no input: the screen stays empty and static
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec!["cat".to_string()],
@@ -2741,6 +2772,7 @@ mod tests {
 
         // Take baseline snapshot to get the current hash
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-baseline".to_string(),
             command: Command::Snapshot {
                 session: Some("await-static-test".to_string()),
@@ -2771,6 +2803,7 @@ mod tests {
         // Await a change that never comes: must time out, not return instantly
         let start = std::time::Instant::now();
         let await_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-await".to_string(),
             command: Command::Snapshot {
                 session: Some("await-static-test".to_string()),
@@ -2845,6 +2878,7 @@ mod tests {
 
         // Spawn a command that keeps changing the screen
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-1".to_string(),
             command: Command::Spawn {
                 command: vec![
@@ -2875,6 +2909,7 @@ mod tests {
         // Ask for a settled screen: it never settles, so this must time out
         let start = std::time::Instant::now();
         let settle_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-settle".to_string(),
             command: Command::Snapshot {
                 session: Some("settle-busy-test".to_string()),
@@ -2945,6 +2980,7 @@ mod tests {
 
         // Try to spawn with nonexistent cwd
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-bad-cwd".to_string(),
             command: Command::Spawn {
                 command: vec!["pwd".to_string()],
@@ -3018,6 +3054,7 @@ mod tests {
         // - [OK] and [Cancel] → Buttons (bracket pattern, confidence 0.8)
         // - [x] and [ ] → Toggles (checkbox pattern, confidence 1.0)
         let spawn_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "spawn-elem".to_string(),
             command: Command::Spawn {
                 command: vec![
@@ -3047,6 +3084,7 @@ mod tests {
 
         // Request snapshot with Full format (includes elements)
         let snap_request = Request {
+            protocol: PROTOCOL_VERSION,
             id: "snap-elem".to_string(),
             command: Command::Snapshot {
                 session: Some("elem-test".to_string()),

@@ -10,11 +10,34 @@ fn default_snapshot_timeout() -> u64 {
     30000
 }
 
+/// Current daemon protocol version.
+///
+/// Carried on every `Request` and `Response` so a client and an
+/// already-running daemon can detect version skew (e.g. mid-upgrade).
+/// Messages from binaries that predate versioning deserialize as version 0
+/// via `#[serde(default)]`. Bump when a change is incompatible; additive
+/// fields and enum variants do not require a bump on their own, but a client
+/// must treat a lower daemon version as "this command may not exist yet".
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// A request from CLI to daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
     pub command: Command,
+    /// Protocol version spoken by the client. 0 = predates versioning.
+    #[serde(default)]
+    pub protocol: u32,
+}
+
+impl Request {
+    pub fn new(id: impl Into<String>, command: Command) -> Self {
+        Self {
+            id: id.into(),
+            command,
+            protocol: PROTOCOL_VERSION,
+        }
+    }
 }
 
 /// Commands the daemon can execute.
@@ -128,6 +151,9 @@ pub struct Response {
     pub data: Option<ResponseData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiError>,
+    /// Protocol version spoken by the daemon. 0 = predates versioning.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 impl Response {
@@ -137,6 +163,7 @@ impl Response {
             success: true,
             data: Some(data),
             error: None,
+            protocol: PROTOCOL_VERSION,
         }
     }
 
@@ -146,6 +173,7 @@ impl Response {
             success: false,
             data: None,
             error: Some(error),
+            protocol: PROTOCOL_VERSION,
         }
     }
 }
@@ -182,4 +210,58 @@ pub struct SessionInfo {
     pub name: Option<String>,
     pub command: Vec<String>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_serializes_with_protocol_version() {
+        let request = Request::new("req-1", Command::ListSessions);
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"protocol\":1"), "got: {json}");
+    }
+
+    #[test]
+    fn legacy_request_without_protocol_deserializes_as_version_zero() {
+        // Wire format sent by clients that predate protocol versioning.
+        let json = r#"{"id":"req-1","command":{"action":"list_sessions"}}"#;
+        let request: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(request.protocol, 0);
+        assert_eq!(request.id, "req-1");
+    }
+
+    #[test]
+    fn legacy_daemon_ignores_unknown_protocol_field() {
+        // A current client's request must still parse if a field is unknown
+        // to the receiver; serde ignores unknown fields by default. Guard
+        // against someone adding deny_unknown_fields later.
+        let json = r#"{"id":"req-1","command":{"action":"list_sessions"},"protocol":1,"future_field":true}"#;
+        let request: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(request.protocol, 1);
+    }
+
+    #[test]
+    fn response_constructors_set_protocol_version() {
+        let ok = Response::success(
+            "req-1",
+            ResponseData::Ok {
+                message: "done".to_string(),
+            },
+        );
+        assert_eq!(ok.protocol, PROTOCOL_VERSION);
+
+        let err = Response::error("req-2", ApiError::session_not_found("nope"));
+        assert_eq!(err.protocol, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn legacy_response_without_protocol_deserializes_as_version_zero() {
+        // Wire format sent by daemons that predate protocol versioning:
+        // the client uses version 0 to detect a stale running daemon.
+        let json = r#"{"id":"req-1","success":true}"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+        assert_eq!(response.protocol, 0);
+    }
 }
