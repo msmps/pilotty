@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use pilotty_core::error::ApiError;
 use pilotty_core::input::encode_mouse_click_combined;
 use pilotty_core::protocol::{
-    supports_protocol, CaptureExit, CaptureOutcome, Command, LogsFormat, Request, Response,
+    supports_protocol, CaptureExit, CaptureOutcome, Command, OutputFormat, Request, Response,
     ResponseData, ScreenCapture, SnapshotFormat,
 };
 use pilotty_core::snapshot::{CursorState, ScreenState, TerminalSize};
@@ -22,7 +22,7 @@ use crate::daemon::paths;
 use crate::daemon::pty::TermSize;
 use crate::daemon::retention::{RetentionSnapshot, DEFAULT_RETAIN_BYTES};
 use crate::daemon::session::{
-    LogEvidence, ObservationEvent, SessionEvidence, SessionId, SessionManager, SessionObserver,
+    ObservationEvent, OutputEvidence, SessionEvidence, SessionId, SessionManager, SessionObserver,
     SnapshotData,
 };
 use crate::daemon::terminal::render_retained_output;
@@ -593,7 +593,9 @@ async fn handle_request(
 
         Command::ListSessions => handle_list_sessions(&request_id, &sessions).await,
 
-        Command::Logs { session, ansi } => handle_logs(&request_id, &sessions, session, ansi).await,
+        Command::Output { session, ansi } => {
+            handle_output(&request_id, &sessions, session, ansi).await
+        }
 
         Command::Status { session } => handle_status(&request_id, &sessions, session).await,
 
@@ -721,8 +723,8 @@ async fn handle_spawn(
     }
 }
 
-/// Handle logs command.
-async fn handle_logs(
+/// Handle retained output command.
+async fn handle_output(
     request_id: &str,
     sessions: &SessionManager,
     session: Option<String>,
@@ -733,9 +735,9 @@ async fn handle_logs(
         Err(error) => return Response::error(request_id, error),
     };
 
-    let logs = match evidence {
-        SessionEvidence::Live(session_id) => sessions.session_logs(&session_id).await,
-        SessionEvidence::Exited(tombstone) => Ok(LogEvidence {
+    let output = match evidence {
+        SessionEvidence::Live(session_id) => sessions.session_output(&session_id).await,
+        SessionEvidence::Exited(tombstone) => Ok(OutputEvidence {
             size: TermSize {
                 cols: tombstone.final_screen.size.cols,
                 rows: tombstone.final_screen.size.rows,
@@ -743,28 +745,28 @@ async fn handle_logs(
             output: tombstone.output,
         }),
     };
-    match logs {
-        Ok(logs) => logs_response(request_id, logs, ansi).await,
+    match output {
+        Ok(output) => output_response(request_id, output, ansi).await,
         Err(error) => Response::error(request_id, error),
     }
 }
 
-async fn logs_response(request_id: &str, logs: LogEvidence, ansi: bool) -> Response {
+async fn output_response(request_id: &str, output: OutputEvidence, ansi: bool) -> Response {
     let RetentionSnapshot {
         bytes,
         total_bytes,
         retained_bytes,
         dropped_bytes,
         truncated,
-    } = logs.output;
+    } = output.output;
     let (format, bytes) = if ansi {
-        (LogsFormat::Ansi, bytes)
+        (OutputFormat::Ansi, bytes)
     } else {
-        let size = logs.size;
+        let size = output.size;
         let rendered =
             tokio::task::spawn_blocking(move || render_retained_output(&bytes, size)).await;
         match rendered {
-            Ok(text) => (LogsFormat::Text, text.into_bytes()),
+            Ok(text) => (OutputFormat::Text, text.into_bytes()),
             Err(error) => {
                 return Response::error(
                     request_id,
@@ -776,7 +778,7 @@ async fn logs_response(request_id: &str, logs: LogEvidence, ansi: bool) -> Respo
 
     Response::success(
         request_id,
-        ResponseData::Logs {
+        ResponseData::Output {
             format,
             bytes,
             total_bytes,
@@ -1862,9 +1864,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logs_render_text_by_default_and_preserve_ansi_on_request() {
+    async fn output_renders_text_by_default_and_preserves_ansi_on_request() {
         let raw = b"\x1b[31mred\x1b[0m".to_vec();
-        let evidence = || LogEvidence {
+        let evidence = || OutputEvidence {
             output: RetentionSnapshot {
                 bytes: raw.clone(),
                 total_bytes: raw.len() as u64,
@@ -1875,21 +1877,21 @@ mod tests {
             size: TermSize { cols: 80, rows: 24 },
         };
 
-        let text = logs_response("text", evidence(), false).await;
+        let text = output_response("text", evidence(), false).await;
         assert!(matches!(
             text.data,
-            Some(ResponseData::Logs {
-                format: LogsFormat::Text,
+            Some(ResponseData::Output {
+                format: OutputFormat::Text,
                 bytes,
                 ..
             }) if bytes == b"red"
         ));
 
-        let ansi = logs_response("ansi", evidence(), true).await;
+        let ansi = output_response("ansi", evidence(), true).await;
         assert!(matches!(
             ansi.data,
-            Some(ResponseData::Logs {
-                format: LogsFormat::Ansi,
+            Some(ResponseData::Output {
+                format: OutputFormat::Ansi,
                 bytes,
                 ..
             }) if bytes == raw
@@ -1897,11 +1899,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_request_cannot_dispatch_logs() {
+    async fn legacy_request_cannot_dispatch_output() {
         let response = handle_request(
             Request {
-                id: "legacy-logs".to_string(),
-                command: Command::Logs {
+                id: "legacy-output".to_string(),
+                command: Command::Output {
                     session: None,
                     ansi: false,
                 },
@@ -2111,10 +2113,10 @@ mod tests {
             })) if text.contains("recovered-evidence")
         ));
 
-        let logs = handle_request(
+        let output = handle_request(
             Request::new(
-                "logs",
-                Command::Logs {
+                "output",
+                Command::Output {
                     session: Some("finalized".to_string()),
                     ansi: true,
                 },
@@ -2124,18 +2126,18 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            logs.data,
-            Some(ResponseData::Logs {
-                format: LogsFormat::Ansi,
+            output.data,
+            Some(ResponseData::Output {
+                format: OutputFormat::Ansi,
                 bytes,
                 ..
             }) if bytes.ends_with(b"recovered-evidence")
         ));
 
-        let readable_logs = handle_request(
+        let readable_output = handle_request(
             Request::new(
-                "readable-logs",
-                Command::Logs {
+                "readable-output",
+                Command::Output {
                     session: Some("finalized".to_string()),
                     ansi: false,
                 },
@@ -2145,9 +2147,9 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            readable_logs.data,
-            Some(ResponseData::Logs {
-                format: LogsFormat::Text,
+            readable_output.data,
+            Some(ResponseData::Output {
+                format: OutputFormat::Text,
                 bytes,
                 ..
             }) if std::str::from_utf8(&bytes).is_ok_and(|text| text.contains("recovered-evidence"))
@@ -2275,9 +2277,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logs_returns_bounded_ordered_raw_output_over_the_socket() {
+    async fn output_returns_bounded_ordered_raw_bytes_over_the_socket() {
         let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("pilotty-logs-{}.sock", std::process::id()));
+        let socket_path = temp_dir.join(format!("pilotty-output-{}.sock", std::process::id()));
         let pid_path = socket_path.with_extension("pid");
         let server = DaemonServer::bind_to_with_retain_bytes(socket_path.clone(), pid_path, 4)
             .await
@@ -2292,14 +2294,14 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let spawn = Request::new(
-            "spawn-logs",
+            "spawn-output",
             Command::Spawn {
                 command: vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "printf abcdef; sleep 2".to_string(),
                 ],
-                session_name: Some("logs-test".to_string()),
+                session_name: Some("output-test".to_string()),
                 cwd: None,
                 retain_bytes: None,
             },
@@ -2319,31 +2321,32 @@ mod tests {
         let spawn_response: Response = serde_json::from_str(&line).expect("parse spawn response");
         assert!(spawn_response.success);
 
-        let logs = timeout(Duration::from_secs(2), async {
+        let output = timeout(Duration::from_secs(2), async {
             loop {
                 let request = Request::new(
                     Uuid::new_v4().to_string(),
-                    Command::Logs {
-                        session: Some("logs-test".to_string()),
+                    Command::Output {
+                        session: Some("output-test".to_string()),
                         ansi: true,
                     },
                 );
                 writer
                     .write_all(
                         serde_json::to_string(&request)
-                            .expect("serialize logs")
+                            .expect("serialize output")
                             .as_bytes(),
                     )
                     .await
-                    .expect("write logs");
+                    .expect("write output");
                 writer.write_all(b"\n").await.expect("write newline");
-                writer.flush().await.expect("flush logs");
+                writer.flush().await.expect("flush output");
                 line.clear();
-                reader.read_line(&mut line).await.expect("read logs");
-                let response: Response = serde_json::from_str(&line).expect("parse logs response");
+                reader.read_line(&mut line).await.expect("read output");
+                let response: Response =
+                    serde_json::from_str(&line).expect("parse output response");
                 if matches!(
                     &response.data,
-                    Some(ResponseData::Logs { total_bytes: 6, .. })
+                    Some(ResponseData::Output { total_bytes: 6, .. })
                 ) {
                     break response;
                 }
@@ -2354,9 +2357,9 @@ mod tests {
         .expect("retained output");
 
         assert_eq!(
-            logs.data,
-            Some(ResponseData::Logs {
-                format: LogsFormat::Ansi,
+            output.data,
+            Some(ResponseData::Output {
+                format: OutputFormat::Ansi,
                 bytes: b"cdef".to_vec(),
                 total_bytes: 6,
                 retained_bytes: 4,

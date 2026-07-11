@@ -6,7 +6,7 @@ mod daemon;
 use clap::Parser;
 use pilotty_core::error::ErrorCode;
 use pilotty_core::protocol::{
-    CaptureOutcome, Command, LogsFormat, Request, ResponseData, ScrollDirection, SnapshotFormat,
+    CaptureOutcome, Command, OutputFormat, Request, ResponseData, ScrollDirection, SnapshotFormat,
 };
 use std::io::Write;
 use tracing::{error, info};
@@ -118,7 +118,7 @@ fn cli_to_command(cli: &Cli) -> Option<Command> {
             session: args.session.clone(),
         }),
         Commands::ListSessions => Some(Command::ListSessions),
-        Commands::Logs(args) => Some(Command::Logs {
+        Commands::Output(args) => Some(Command::Output {
             session: args.session.clone(),
             ansi: args.ansi,
         }),
@@ -190,7 +190,7 @@ fn run_client_command(cli: Cli) -> anyhow::Result<CliExitCode> {
                     } => {
                         println!("{}", content);
                     }
-                    ResponseData::Logs {
+                    ResponseData::Output {
                         format,
                         bytes,
                         total_bytes,
@@ -199,13 +199,13 @@ fn run_client_command(cli: Cli) -> anyhow::Result<CliExitCode> {
                         truncated,
                     } => {
                         std::io::stdout().write_all(&bytes)?;
-                        if format == LogsFormat::Text && !bytes.ends_with(b"\n") {
+                        if format == OutputFormat::Text && !bytes.ends_with(b"\n") {
                             std::io::stdout().write_all(b"\n")?;
                         }
                         std::io::stdout().flush()?;
                         let format_name = match format {
-                            LogsFormat::Text => "text",
-                            LogsFormat::Ansi => "ansi",
+                            OutputFormat::Text => "text",
+                            OutputFormat::Ansi => "ansi",
                         };
                         eprintln!(
                             "retention: format={format_name} total_bytes={total_bytes} \

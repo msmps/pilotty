@@ -136,7 +136,7 @@ pub enum Command {
     /// List all active sessions.
     ListSessions,
     /// Get readable retained output or exact ANSI/VT bytes for a session.
-    Logs {
+    Output {
         session: Option<String>,
         #[serde(default)]
         ansi: bool,
@@ -172,7 +172,7 @@ impl Command {
                 ..
             }
             | Self::Snapshot { .. }
-            | Self::Logs { .. }
+            | Self::Output { .. }
             | Self::Status { .. } => PROTOCOL_V2,
             Self::Spawn {
                 retain_bytes: None, ..
@@ -203,10 +203,10 @@ pub enum SnapshotFormat {
     Text,
 }
 
-/// Representation returned by the logs command.
+/// Representation returned by the output command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LogsFormat {
+pub enum OutputFormat {
     Text,
     Ansi,
 }
@@ -332,8 +332,8 @@ pub enum ResponseData {
     /// Generic success message.
     Ok { message: String },
     /// Readable or exact output derived from a session's bounded retention window.
-    Logs {
-        format: LogsFormat,
+    Output {
+        format: OutputFormat,
         bytes: Vec<u8>,
         total_bytes: u64,
         retained_bytes: u64,
@@ -351,9 +351,10 @@ impl ResponseData {
     /// older client.
     pub fn minimum_protocol(&self) -> u32 {
         match self {
-            Self::ScreenState(_) | Self::Snapshot { .. } | Self::Logs { .. } | Self::Status(_) => {
-                PROTOCOL_V2
-            }
+            Self::ScreenState(_)
+            | Self::Snapshot { .. }
+            | Self::Output { .. }
+            | Self::Status(_) => PROTOCOL_V2,
             Self::SessionCreated { .. }
             | Self::Sessions { .. }
             | Self::WaitForResult { .. }
@@ -561,7 +562,7 @@ mod tests {
         assert_eq!(configured_spawn.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(outcome_snapshot.minimum_protocol(), PROTOCOL_V2);
         assert_eq!(
-            Command::Logs {
+            Command::Output {
                 session: None,
                 ansi: false,
             }
@@ -597,9 +598,9 @@ mod tests {
     }
 
     #[test]
-    fn logs_response_requires_protocol_v2_and_preserves_raw_bytes() {
-        let response = ResponseData::Logs {
-            format: LogsFormat::Ansi,
+    fn output_response_requires_protocol_v2_and_preserves_raw_bytes() {
+        let response = ResponseData::Output {
+            format: OutputFormat::Ansi,
             bytes: vec![0, 27, 255],
             total_bytes: 9,
             retained_bytes: 3,
@@ -608,8 +609,9 @@ mod tests {
         };
 
         assert_eq!(response.minimum_protocol(), PROTOCOL_V2);
-        let json = serde_json::to_string(&response).expect("serialize logs response");
-        let decoded: ResponseData = serde_json::from_str(&json).expect("deserialize logs response");
+        let json = serde_json::to_string(&response).expect("serialize output response");
+        let decoded: ResponseData =
+            serde_json::from_str(&json).expect("deserialize output response");
         assert_eq!(decoded, response);
     }
 

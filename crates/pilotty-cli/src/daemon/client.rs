@@ -357,8 +357,8 @@ mod tests {
         };
         let error = client
             .request(Request::new(
-                "logs-request",
-                Command::Logs {
+                "output-request",
+                Command::Output {
                     session: None,
                     ansi: false,
                 },

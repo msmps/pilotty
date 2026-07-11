@@ -97,7 +97,7 @@ Examples:
     ListSessions,
 
     /// Print readable retained output for a session
-    Logs(LogsArgs),
+    Output(OutputArgs),
 
     /// Report whether a session is running or exited
     #[command(after_help = "\
@@ -160,7 +160,7 @@ pub struct KillArgs {
 }
 
 #[derive(Debug, clap::Args)]
-pub struct LogsArgs {
+pub struct OutputArgs {
     /// Target session by name or ID [default: default]
     #[arg(short, long, help = SESSION_HELP)]
     pub session: Option<String>,
@@ -355,25 +355,25 @@ mod tests {
     }
 
     #[test]
-    fn logs_parses_session_target() {
-        let cli = Cli::parse_from(["pilotty", "logs", "--session", "editor"]);
+    fn output_parses_session_target() {
+        let cli = Cli::parse_from(["pilotty", "output", "--session", "editor"]);
 
         match cli.command {
-            Commands::Logs(args) => {
+            Commands::Output(args) => {
                 assert_eq!(args.session.as_deref(), Some("editor"));
                 assert!(!args.ansi);
             }
-            _ => panic!("Expected logs command"),
+            _ => panic!("Expected output command"),
         }
     }
 
     #[test]
-    fn logs_parses_ansi_output() {
-        let cli = Cli::parse_from(["pilotty", "logs", "--ansi"]);
+    fn output_parses_ansi_bytes() {
+        let cli = Cli::parse_from(["pilotty", "output", "--ansi"]);
 
         match cli.command {
-            Commands::Logs(args) => assert!(args.ansi),
-            _ => panic!("Expected logs command"),
+            Commands::Output(args) => assert!(args.ansi),
+            _ => panic!("Expected output command"),
         }
     }
 

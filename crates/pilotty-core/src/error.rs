@@ -63,7 +63,7 @@ impl ApiError {
             code: ErrorCode::SessionExited,
             message: format!("Session '{}' exited ({})", session_id, status),
             suggestion: Some(
-                "Run 'pilotty snapshot' or 'pilotty logs' for final evidence. 'pilotty status' reports exit metadata when available."
+                "Run 'pilotty snapshot' or 'pilotty output' for final evidence. 'pilotty status' reports exit metadata when available."
                     .into(),
             ),
         }

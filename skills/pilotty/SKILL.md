@@ -80,12 +80,12 @@ pilotty snapshot --settle 50 --strict           # Exit nonzero on deadline/exit
 ### Retained output
 
 ```bash
-pilotty logs                     # Readable rendered output history
-pilotty logs -s myapp            # Readable history for a named session
-pilotty logs -s myapp --ansi     # Exact retained ANSI/VT bytes
+pilotty output                     # Readable rendered output history
+pilotty output -s myapp            # Readable history for a named session
+pilotty output -s myapp --ansi     # Exact retained ANSI/VT bytes
 ```
 
-Use readable logs to inspect output that has left the visible viewport. Use `--ansi`
+Use readable output to inspect content that has left the visible viewport. Use `--ansi`
 only when exact terminal bytes are required for replay or diagnostics.
 
 ### Input
@@ -145,7 +145,7 @@ pilotty wait-for "~" -s editor    # Wait in specific session
 | `--await-change <hash>` | Block snapshot until content_hash differs |
 | `--settle <ms>` | Wait for screen to be stable for this many ms (default: 0) |
 | `--strict` | Exit 3 on capture deadline or 4 when the session exits |
-| `--ansi` | Write exact retained ANSI/VT bytes from `logs` |
+| `--ansi` | Write exact retained ANSI/VT bytes from `output` |
 
 ### Environment variables
 
@@ -254,7 +254,7 @@ Every snapshot reports why it returned:
 | `changed` | `--await-change` was satisfied | Continue with the new screen |
 | `settled` | The requested stability window was satisfied | Treat the screen as stable |
 | `deadline` | Time expired; latest evidence is included | Inspect evidence, then retry with more time if useful |
-| `exited` | The session ended; final evidence is included | Do not send more input; inspect exit metadata or logs |
+| `exited` | The session ended; final evidence is included | Do not send more input; inspect exit metadata or output |
 
 Deadline and exit outcomes still exit 0 by default. Add `--strict` only when shell
 control flow should fail for those outcomes.
@@ -545,7 +545,7 @@ pilotty uses a background daemon for session management:
 
 - **Auto-start**: Daemon starts on first command
 - **Auto-stop**: Shuts down after 5 minutes with no sessions
-- **Final evidence**: Exited sessions retain status, final screen, and bounded logs for up to 10 minutes
+- **Final evidence**: Exited sessions retain status, final screen, and bounded output for up to 10 minutes
 - **Shared state**: Multiple CLI calls share sessions
 
 You rarely need to manage the daemon manually.
@@ -560,7 +560,7 @@ Errors include actionable suggestions:
 | `1` | Generic/API error | Read the error code, message, and suggestion |
 | `2` | Usage error | Fix the command syntax |
 | `3` | Strict capture deadline | Inspect printed evidence and retry with more time if appropriate |
-| `4` | Session lifecycle ended | Do not retry input against that session; use `status`, `snapshot`, or `logs` |
+| `4` | Session lifecycle ended | Do not retry input against that session; use `status`, `snapshot`, or `output` |
 
 ```json
 {

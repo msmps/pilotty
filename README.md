@@ -121,19 +121,19 @@ pilotty examples                  # Show end-to-end workflow example
 ### Retained Output
 
 ```bash
-pilotty logs                         # Readable rendered output from the default session
-pilotty logs -s myapp                # Readable rendered output from a named session
-pilotty logs -s myapp --ansi > output.ansi # Save exact retained ANSI/VT bytes
+pilotty output                         # Readable retained output from the default session
+pilotty output -s myapp                # Readable retained output from a named session
+pilotty output -s myapp --ansi > output.ansi # Save exact retained ANSI/VT bytes
 ```
 
-`logs` replays the bounded retained byte window into a readable terminal-history tail.
+`output` replays the bounded retained byte window into a readable terminal-history tail.
 `--ansi` writes the exact retained bytes instead. Both modes report exact raw-byte
 retention accounting to stderr, including when older bytes were dropped. Retention is
 bounded to 2 MiB per session by default.
 
 When a session exits, the daemon keeps bounded final evidence in memory for up to 10
 minutes: exit metadata, the final full screen, and the last 64 KiB of raw output.
-`snapshot` and `logs` continue to work during that window. Commands that require a live
+`snapshot` and `output` continue to work during that window. Commands that require a live
 process return `SESSION_EXITED`. Tombstones disappear when they expire, are evicted, or
 the daemon restarts, and never keep the daemon running.
 
