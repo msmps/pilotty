@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::snapshot::ScreenState;
 
 /// Default timeout for snapshot await_change/settle operations (30 seconds).
@@ -19,6 +19,29 @@ fn default_snapshot_timeout() -> u64 {
 /// fields and enum variants do not require a bump on their own, but a client
 /// must treat a lower daemon version as "this command may not exist yet".
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Protocol spoken by binaries that predate explicit versioning.
+pub const LEGACY_PROTOCOL_VERSION: u32 = 0;
+
+/// Whether an observed peer protocol satisfies a wire variant's requirement.
+pub fn supports_protocol(observed: u32, required: u32) -> bool {
+    observed >= required
+}
+
+impl ApiError {
+    /// Oldest protocol that can decode this error without losing meaning.
+    ///
+    /// Keeping the exhaustive error-code mapping with the other wire policy
+    /// makes a new code declare its compatibility before it can compile.
+    pub fn minimum_protocol(&self) -> u32 {
+        match &self.code {
+            ErrorCode::SessionNotFound
+            | ErrorCode::CommandFailed
+            | ErrorCode::InvalidInput
+            | ErrorCode::InternalError => LEGACY_PROTOCOL_VERSION,
+        }
+    }
+}
 
 /// A request from CLI to daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +144,28 @@ pub enum Command {
     Shutdown,
 }
 
+impl Command {
+    /// Oldest protocol that can decode and honor this command.
+    ///
+    /// Keep this match exhaustive so every new command must declare its wire
+    /// compatibility before it can compile.
+    pub fn minimum_protocol(&self) -> u32 {
+        match self {
+            Self::Spawn { .. }
+            | Self::Kill { .. }
+            | Self::Snapshot { .. }
+            | Self::Type { .. }
+            | Self::Key { .. }
+            | Self::Click { .. }
+            | Self::Scroll { .. }
+            | Self::ListSessions
+            | Self::Resize { .. }
+            | Self::WaitFor { .. }
+            | Self::Shutdown => LEGACY_PROTOCOL_VERSION,
+        }
+    }
+}
+
 /// Snapshot output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +221,21 @@ impl Response {
             protocol: PROTOCOL_VERSION,
         }
     }
+
+    /// Oldest protocol that can decode this response without losing meaning.
+    pub fn minimum_protocol(&self) -> u32 {
+        let data_protocol = self
+            .data
+            .as_ref()
+            .map(ResponseData::minimum_protocol)
+            .unwrap_or(LEGACY_PROTOCOL_VERSION);
+        let error_protocol = self
+            .error
+            .as_ref()
+            .map(ApiError::minimum_protocol)
+            .unwrap_or(LEGACY_PROTOCOL_VERSION);
+        data_protocol.max(error_protocol)
+    }
 }
 
 /// Response payload variants.
@@ -201,6 +261,23 @@ pub enum ResponseData {
     },
     /// Generic success message.
     Ok { message: String },
+}
+
+impl ResponseData {
+    /// Oldest protocol that can decode this response payload.
+    ///
+    /// The exhaustive match prevents a new payload from silently reaching an
+    /// older client.
+    pub fn minimum_protocol(&self) -> u32 {
+        match self {
+            Self::ScreenState(_)
+            | Self::Snapshot { .. }
+            | Self::SessionCreated { .. }
+            | Self::Sessions { .. }
+            | Self::WaitForResult { .. }
+            | Self::Ok { .. } => LEGACY_PROTOCOL_VERSION,
+        }
+    }
 }
 
 /// Information about an active session.
@@ -263,5 +340,48 @@ mod tests {
         let json = r#"{"id":"req-1","success":true}"#;
         let response: Response = serde_json::from_str(json).unwrap();
         assert_eq!(response.protocol, 0);
+    }
+
+    #[test]
+    fn legacy_client_ignores_unknown_response_protocol_field() {
+        #[derive(Deserialize)]
+        struct LegacyResponse {
+            id: String,
+            success: bool,
+        }
+
+        let response = Response::success(
+            "req-1",
+            ResponseData::Ok {
+                message: "done".to_string(),
+            },
+        );
+        let json = serde_json::to_string(&response).expect("serialize current response");
+        let legacy: LegacyResponse =
+            serde_json::from_str(&json).expect("legacy client should ignore added fields");
+
+        assert_eq!(legacy.id, "req-1");
+        assert!(legacy.success);
+    }
+
+    #[test]
+    fn protocol_support_is_monotonic() {
+        assert!(supports_protocol(1, 0));
+        assert!(supports_protocol(1, 1));
+        assert!(!supports_protocol(0, 1));
+    }
+
+    #[test]
+    fn existing_wire_variants_remain_legacy_compatible() {
+        let command = Command::ListSessions;
+        let response = Response::success(
+            "req-1",
+            ResponseData::Ok {
+                message: "done".to_string(),
+            },
+        );
+
+        assert_eq!(command.minimum_protocol(), 0);
+        assert_eq!(response.minimum_protocol(), 0);
     }
 }
